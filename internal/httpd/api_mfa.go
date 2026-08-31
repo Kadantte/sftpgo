@@ -15,18 +15,16 @@
 package httpd
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"slices"
-	"strconv"
 	"strings"
 
 	"github.com/go-chi/render"
 
 	"github.com/drakkan/sftpgo/v2/internal/dataprovider"
+	"github.com/drakkan/sftpgo/v2/internal/jwt"
 	"github.com/drakkan/sftpgo/v2/internal/kms"
 	"github.com/drakkan/sftpgo/v2/internal/mfa"
 	"github.com/drakkan/sftpgo/v2/internal/util"
@@ -66,13 +64,13 @@ func getTOTPConfigs(w http.ResponseWriter, r *http.Request) {
 
 func generateTOTPSecret(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestSize)
-	claims, err := getTokenClaims(r)
+	claims, err := jwt.FromContext(r.Context())
 	if err != nil || claims.Username == "" {
 		sendAPIResponse(w, r, err, "Invalid token claims", http.StatusBadRequest)
 		return
 	}
 	var accountName string
-	if claims.hasUserAudience() {
+	if hasUserAudience(claims) {
 		accountName = fmt.Sprintf("User %q", claims.Username)
 	} else {
 		accountName = fmt.Sprintf("Admin %q", claims.Username)
@@ -98,33 +96,20 @@ func generateTOTPSecret(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func getQRCode(w http.ResponseWriter, r *http.Request) {
-	r.Body = http.MaxBytesReader(w, r.Body, maxRequestSize)
-	img, err := mfa.GenerateQRCodeFromURL(r.URL.Query().Get("url"), 400, 400)
-	if err != nil {
-		sendAPIResponse(w, r, nil, "unable to generate qr code", http.StatusInternalServerError)
-		return
-	}
-	imgSize := int64(len(img))
-	w.Header().Set("Content-Length", strconv.FormatInt(imgSize, 10))
-	w.Header().Set("Content-Type", "image/png")
-	io.CopyN(w, bytes.NewBuffer(img), imgSize) //nolint:errcheck
-}
-
 func saveTOTPConfig(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestSize)
-	claims, err := getTokenClaims(r)
+	claims, err := jwt.FromContext(r.Context())
 	if err != nil || claims.Username == "" {
 		sendAPIResponse(w, r, err, "Invalid token claims", http.StatusBadRequest)
 		return
 	}
 	recoveryCodes := make([]dataprovider.RecoveryCode, 0, 12)
-	for i := 0; i < 12; i++ {
+	for range 12 {
 		code := getNewRecoveryCode()
 		recoveryCodes = append(recoveryCodes, dataprovider.RecoveryCode{Secret: kms.NewPlainSecret(code)})
 	}
 	baseURL := webBaseClientPath
-	if claims.hasUserAudience() {
+	if hasUserAudience(claims) {
 		if err := saveUserTOTPConfig(claims.Username, r, recoveryCodes); err != nil {
 			sendAPIResponse(w, r, err, "", getRespStatus(err))
 			return
@@ -164,14 +149,14 @@ func validateTOTPPasscode(w http.ResponseWriter, r *http.Request) {
 
 func getRecoveryCodes(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestSize)
-	claims, err := getTokenClaims(r)
+	claims, err := jwt.FromContext(r.Context())
 	if err != nil || claims.Username == "" {
 		sendAPIResponse(w, r, err, "Invalid token claims", http.StatusBadRequest)
 		return
 	}
 	recoveryCodes := make([]recoveryCode, 0, 12)
 	var accountRecoveryCodes []dataprovider.RecoveryCode
-	if claims.hasUserAudience() {
+	if hasUserAudience(claims) {
 		user, err := dataprovider.UserExists(claims.Username, "")
 		if err != nil {
 			sendAPIResponse(w, r, err, "", getRespStatus(err))
@@ -210,19 +195,19 @@ func getRecoveryCodes(w http.ResponseWriter, r *http.Request) {
 
 func generateRecoveryCodes(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestSize)
-	claims, err := getTokenClaims(r)
+	claims, err := jwt.FromContext(r.Context())
 	if err != nil || claims.Username == "" {
 		sendAPIResponse(w, r, err, "Invalid token claims", http.StatusBadRequest)
 		return
 	}
 	recoveryCodes := make([]string, 0, 12)
 	accountRecoveryCodes := make([]dataprovider.RecoveryCode, 0, 12)
-	for i := 0; i < 12; i++ {
+	for range 12 {
 		code := getNewRecoveryCode()
 		recoveryCodes = append(recoveryCodes, code)
 		accountRecoveryCodes = append(accountRecoveryCodes, dataprovider.RecoveryCode{Secret: kms.NewPlainSecret(code)})
 	}
-	if claims.hasUserAudience() {
+	if hasUserAudience(claims) {
 		user, err := dataprovider.UserExists(claims.Username, "")
 		if err != nil {
 			sendAPIResponse(w, r, err, "", getRespStatus(err))
@@ -284,6 +269,12 @@ func saveUserTOTPConfig(username string, r *http.Request, recoveryCodes []datapr
 	if user.Filters.TOTPConfig.Secret == nil || !user.Filters.TOTPConfig.Secret.IsPlain() {
 		user.Filters.TOTPConfig.Secret = currentTOTPSecret
 	}
+	if user.Filters.TOTPConfig.Enabled && user.Filters.TOTPConfig.Secret != nil &&
+		user.Filters.TOTPConfig.Secret.IsPlain() {
+		if err := mfa.ValidateTOTPSecret(user.Filters.TOTPConfig.Secret.GetPayload()); err != nil {
+			return util.NewValidationError(err.Error())
+		}
+	}
 	if user.Filters.TOTPConfig.Enabled {
 		if user.CountUnusedRecoveryCodes() < 5 && user.Filters.TOTPConfig.Enabled {
 			user.Filters.RecoveryCodes = recoveryCodes
@@ -317,6 +308,12 @@ func saveAdminTOTPConfig(username string, r *http.Request, recoveryCodes []datap
 	}
 	if admin.Filters.TOTPConfig.Secret == nil || !admin.Filters.TOTPConfig.Secret.IsPlain() {
 		admin.Filters.TOTPConfig.Secret = currentTOTPSecret
+	}
+	if admin.Filters.TOTPConfig.Enabled && admin.Filters.TOTPConfig.Secret != nil &&
+		admin.Filters.TOTPConfig.Secret.IsPlain() {
+		if err := mfa.ValidateTOTPSecret(admin.Filters.TOTPConfig.Secret.GetPayload()); err != nil {
+			return util.NewValidationError(err.Error())
+		}
 	}
 	return dataprovider.UpdateAdmin(&admin, dataprovider.ActionExecutorSelf, util.GetIPFromRemoteAddress(r.RemoteAddr), admin.Role)
 }

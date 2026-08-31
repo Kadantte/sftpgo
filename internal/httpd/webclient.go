@@ -16,6 +16,7 @@ package httpd
 
 import (
 	"bytes"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -38,6 +39,7 @@ import (
 
 	"github.com/drakkan/sftpgo/v2/internal/common"
 	"github.com/drakkan/sftpgo/v2/internal/dataprovider"
+	"github.com/drakkan/sftpgo/v2/internal/jwt"
 	"github.com/drakkan/sftpgo/v2/internal/logger"
 	"github.com/drakkan/sftpgo/v2/internal/mfa"
 	"github.com/drakkan/sftpgo/v2/internal/smtp"
@@ -192,7 +194,8 @@ type clientProfilePage struct {
 
 type changeClientPasswordPage struct {
 	baseClientPage
-	Error *util.I18nError
+	Error          *util.I18nError
+	RequiredAction *util.I18nError
 }
 
 type clientMFAPage struct {
@@ -205,11 +208,13 @@ type clientMFAPage struct {
 	RecCodesURL       string
 	Protocols         []string
 	RequiredProtocols []string
+	RequiredAction    *util.I18nError
 }
 
 type clientSharesPage struct {
 	baseClientPage
 	BasePublicSharesURL string
+	BaseURL             string
 }
 
 type clientSharePage struct {
@@ -568,7 +573,7 @@ func (s *httpdServer) renderClientForgotPwdPage(w http.ResponseWriter, r *http.R
 		commonBasePage: getCommonBasePage(r),
 		CurrentURL:     webClientForgotPwdPath,
 		Error:          err,
-		CSRFToken:      createCSRFToken(w, r, s.csrfTokenAuth, xid.New().String(), webBaseClientPath),
+		CSRFToken:      createCSRFToken(w, r, s.csrfTokenAuth, rand.Text(), webBaseClientPath),
 		LoginURL:       webClientLoginPath,
 		Title:          util.I18nForgotPwdTitle,
 		Branding:       s.binding.webClientBranding(),
@@ -597,7 +602,7 @@ func (s *httpdServer) renderShareLoginPage(w http.ResponseWriter, r *http.Reques
 		Title:          util.I18nShareLoginTitle,
 		CurrentURL:     r.RequestURI,
 		Error:          err,
-		CSRFToken:      createCSRFToken(w, r, s.csrfTokenAuth, xid.New().String(), webBaseClientPath),
+		CSRFToken:      createCSRFToken(w, r, s.csrfTokenAuth, rand.Text(), webBaseClientPath),
 		Branding:       s.binding.webClientBranding(),
 		Languages:      s.binding.languages(),
 		CheckRedirect:  false,
@@ -653,8 +658,8 @@ func (s *httpdServer) renderClientTwoFactorPage(w http.ResponseWriter, r *http.R
 		Branding:       s.binding.webClientBranding(),
 		Languages:      s.binding.languages(),
 	}
-	if next := r.URL.Query().Get("next"); strings.HasPrefix(next, webClientFilesPath) {
-		data.CurrentURL += "?next=" + url.QueryEscape(next)
+	if target, ok := safeRedirectTarget(r.URL.Query().Get("next"), webClientFilesPath); ok {
+		data.CurrentURL += "?next=" + url.QueryEscape(target)
 	}
 	renderClientTemplate(w, templateTwoFactor, data)
 }
@@ -689,6 +694,23 @@ func (s *httpdServer) renderClientMFAPage(w http.ResponseWriter, r *http.Request
 	}
 	data.TOTPConfig = user.Filters.TOTPConfig
 	data.RequiredProtocols = user.Filters.TwoFactorAuthProtocols
+	if claims, claimsErr := jwt.FromContext(r.Context()); claimsErr == nil && claims.MustSetTwoFactorAuth {
+		if len(claims.RequiredTwoFactorProtocols) > 0 {
+			protocols := strings.Join(claims.RequiredTwoFactorProtocols, ", ")
+			data.RequiredAction = util.NewI18nError(
+				util.NewGenericError("Two-factor authentication setup required"),
+				util.I18nError2FARequired,
+				util.I18nErrorArgs(map[string]any{
+					"val": protocols,
+				}),
+			)
+		} else {
+			data.RequiredAction = util.NewI18nError(
+				util.NewGenericError("Two-factor authentication setup required"),
+				util.I18nError2FARequiredGeneric,
+			)
+		}
+	}
 	renderClientTemplate(w, templateClientMFA, data)
 }
 
@@ -872,13 +894,18 @@ func (s *httpdServer) renderClientChangePasswordPage(w http.ResponseWriter, r *h
 		baseClientPage: s.getBaseClientPageData(util.I18nChangePwdTitle, webChangeClientPwdPath, w, r),
 		Error:          err,
 	}
-
+	if claims, claimsErr := jwt.FromContext(r.Context()); claimsErr == nil && claims.MustChangePassword {
+		data.RequiredAction = util.NewI18nError(
+			util.NewGenericError("Password change required"),
+			util.I18nErrorChangePwdRequired,
+		)
+	}
 	renderClientTemplate(w, templateChangePwd, data)
 }
 
 func (s *httpdServer) handleWebClientDownloadZip(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxMultipartMem)
-	claims, err := getTokenClaims(r)
+	claims, err := jwt.FromContext(r.Context())
 	if err != nil || claims.Username == "" {
 		s.renderClientForbiddenPage(w, r, util.NewI18nError(errInvalidTokenClaims, util.I18nErrorInvalidToken))
 		return
@@ -906,11 +933,8 @@ func (s *httpdServer) handleWebClientDownloadZip(w http.ResponseWriter, r *http.
 		s.renderClientForbiddenPage(w, r, err)
 		return
 	}
-	connection := &Connection{
-		BaseConnection: common.NewBaseConnection(connID, protocol, util.GetHTTPLocalAddress(r),
-			r.RemoteAddr, user),
-		request: r,
-	}
+	baseConn := common.NewBaseConnection(connID, protocol, util.GetHTTPLocalAddress(r), r.RemoteAddr, user)
+	connection := newConnection(baseConn, w, r)
 	if err = common.Connections.Add(connection); err != nil {
 		s.renderClientMessagePage(w, r, util.I18nError429Title, http.StatusTooManyRequests,
 			util.NewI18nError(err, util.I18nError429Message), "")
@@ -943,6 +967,8 @@ func (s *httpdServer) handleClientSharePartialDownload(w http.ResponseWriter, r 
 	if err != nil {
 		return
 	}
+	defer connection.CloseFS()
+
 	if err := validateBrowsableShare(share, connection); err != nil {
 		s.renderClientMessagePage(w, r, util.I18nShareAccessErrorTitle, getRespStatus(err), err, "")
 		return
@@ -974,7 +1000,10 @@ func (s *httpdServer) handleClientSharePartialDownload(w http.ResponseWriter, r 
 		return
 	}
 
-	dataprovider.UpdateShareLastUse(&share, 1) //nolint:errcheck
+	if err := dataprovider.UpdateShareLastUse(&share, 1); err != nil {
+		s.renderClientMessagePage(w, r, util.I18nShareAccessErrorTitle, getRespStatus(err), err, "")
+		return
+	}
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"",
 		getCompressedFileName(fmt.Sprintf("share-%s", share.Name), filesList)))
 	renderCompressedFiles(w, connection, name, filesList, &share)
@@ -987,6 +1016,8 @@ func (s *httpdServer) handleShareGetDirContents(w http.ResponseWriter, r *http.R
 	if err != nil {
 		return
 	}
+	defer connection.CloseFS()
+
 	if err := validateBrowsableShare(share, connection); err != nil {
 		sendAPIResponse(w, r, err, getI18NErrorString(err, util.I18nError500Message), getRespStatus(err))
 		return
@@ -1009,20 +1040,17 @@ func (s *httpdServer) handleShareGetDirContents(w http.ResponseWriter, r *http.R
 	}
 	defer lister.Close()
 
-	dataGetter := func(limit, _ int) ([]byte, int, error) {
-		contents, err := lister.Next(limit)
-		if errors.Is(err, io.EOF) {
-			err = nil
-		}
+	dataGetter := func(limit, offset int) ([]byte, int, error) {
+		contents, finished, err := nextRenderableEntries(lister, limit, func(info os.FileInfo) bool {
+			return info.Mode().IsDir() || info.Mode().IsRegular()
+		})
 		if err != nil {
 			return nil, 0, err
 		}
 		results := make([]map[string]any, 0, len(contents))
-		for _, info := range contents {
-			if !info.Mode().IsDir() && !info.Mode().IsRegular() {
-				continue
-			}
+		for idx, info := range contents {
 			res := make(map[string]any)
+			res["id"] = offset + idx + 1
 			if info.IsDir() {
 				res["type"] = "1"
 				res["size"] = ""
@@ -1039,8 +1067,8 @@ func (s *httpdServer) handleShareGetDirContents(w http.ResponseWriter, r *http.R
 		}
 		data, err := json.Marshal(results)
 		count := limit
-		if len(results) == 0 {
-			count = 0
+		if finished {
+			count = len(results)
 		}
 		return data, count, err
 	}
@@ -1051,10 +1079,12 @@ func (s *httpdServer) handleShareGetDirContents(w http.ResponseWriter, r *http.R
 func (s *httpdServer) handleClientUploadToShare(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestSize)
 	validScopes := []dataprovider.ShareScope{dataprovider.ShareScopeWrite, dataprovider.ShareScopeReadWrite}
-	share, _, err := s.checkPublicShare(w, r, validScopes)
+	share, connection, err := s.checkPublicShare(w, r, validScopes)
 	if err != nil {
 		return
 	}
+	defer connection.CloseFS()
+
 	if share.Scope == dataprovider.ShareScopeReadWrite {
 		http.Redirect(w, r, path.Join(webClientPubSharesPath, share.ShareID, "browse"), http.StatusFound)
 		return
@@ -1069,6 +1099,8 @@ func (s *httpdServer) handleShareGetFiles(w http.ResponseWriter, r *http.Request
 	if err != nil {
 		return
 	}
+	defer connection.CloseFS()
+
 	if err := validateBrowsableShare(share, connection); err != nil {
 		s.renderClientMessagePage(w, r, util.I18nShareAccessErrorTitle, getRespStatus(err), err, "")
 		return
@@ -1101,9 +1133,12 @@ func (s *httpdServer) handleShareGetFiles(w http.ResponseWriter, r *http.Request
 		s.renderSharedFilesPage(w, r, share.GetRelativePath(name), nil, share)
 		return
 	}
-	dataprovider.UpdateShareLastUse(&share, 1) //nolint:errcheck
+	if err := dataprovider.UpdateShareLastUse(&share, 1); err != nil {
+		s.renderClientMessagePage(w, r, util.I18nShareAccessErrorTitle, getRespStatus(err), err, "")
+		return
+	}
 	if status, err := downloadFile(w, r, connection, name, info, false, &share); err != nil {
-		dataprovider.UpdateShareLastUse(&share, -1) //nolint:errcheck
+		_ = dataprovider.UpdateShareLastUse(&share, -1)
 		if status > 0 {
 			s.renderSharedFilesPage(w, r, path.Dir(share.GetRelativePath(name)),
 				util.NewI18nError(err, i18nFsMsg(getRespStatus(err))), share)
@@ -1114,10 +1149,12 @@ func (s *httpdServer) handleShareGetFiles(w http.ResponseWriter, r *http.Request
 func (s *httpdServer) handleShareViewPDF(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxLoginBodySize)
 	validScopes := []dataprovider.ShareScope{dataprovider.ShareScopeRead, dataprovider.ShareScopeReadWrite}
-	share, _, err := s.checkPublicShare(w, r, validScopes)
+	share, connection, err := s.checkPublicShare(w, r, validScopes)
 	if err != nil {
 		return
 	}
+	defer connection.CloseFS()
+
 	name := util.CleanPath(r.URL.Query().Get("path"))
 	data := viewPDFPage{
 		commonBasePage: getCommonBasePage(r),
@@ -1137,6 +1174,8 @@ func (s *httpdServer) handleShareGetPDF(w http.ResponseWriter, r *http.Request) 
 	if err != nil {
 		return
 	}
+	defer connection.CloseFS()
+
 	if err := validateBrowsableShare(share, connection); err != nil {
 		s.renderClientMessagePage(w, r, util.I18nShareAccessErrorTitle, getRespStatus(err), err, "")
 		return
@@ -1165,19 +1204,22 @@ func (s *httpdServer) handleShareGetPDF(w http.ResponseWriter, r *http.Request) 
 		s.renderClientBadRequestPage(w, r, util.NewI18nError(fmt.Errorf("%q is not a file", name), util.I18nErrorPDFMessage))
 		return
 	}
-	connection.User.CheckFsRoot(connection.ID) //nolint:errcheck
+	_ = connection.User.CheckFsRoot(connection.ID)
 	if err := s.ensurePDF(w, r, name, connection); err != nil {
 		return
 	}
-	dataprovider.UpdateShareLastUse(&share, 1) //nolint:errcheck
+	if err := dataprovider.UpdateShareLastUse(&share, 1); err != nil {
+		s.renderClientMessagePage(w, r, util.I18nShareAccessErrorTitle, getRespStatus(err), err, "")
+		return
+	}
 	if _, err := downloadFile(w, r, connection, name, info, true, &share); err != nil {
-		dataprovider.UpdateShareLastUse(&share, -1) //nolint:errcheck
+		_ = dataprovider.UpdateShareLastUse(&share, -1)
 	}
 }
 
 func (s *httpdServer) handleClientGetDirContents(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestSize)
-	claims, err := getTokenClaims(r)
+	claims, err := jwt.FromContext(r.Context())
 	if err != nil || claims.Username == "" {
 		sendAPIResponse(w, r, nil, util.I18nErrorDirList403, http.StatusForbidden)
 		return
@@ -1196,11 +1238,8 @@ func (s *httpdServer) handleClientGetDirContents(w http.ResponseWriter, r *http.
 		sendAPIResponse(w, r, err, getI18NErrorString(err, util.I18nErrorDirList403), http.StatusForbidden)
 		return
 	}
-	connection := &Connection{
-		BaseConnection: common.NewBaseConnection(connID, protocol, util.GetHTTPLocalAddress(r),
-			r.RemoteAddr, user),
-		request: r,
-	}
+	baseConn := common.NewBaseConnection(connID, protocol, util.GetHTTPLocalAddress(r), r.RemoteAddr, user)
+	connection := newConnection(baseConn, w, r)
 	if err = common.Connections.Add(connection); err != nil {
 		sendAPIResponse(w, r, err, util.I18nErrorDirList429, http.StatusTooManyRequests)
 		return
@@ -1217,26 +1256,23 @@ func (s *httpdServer) handleClientGetDirContents(w http.ResponseWriter, r *http.
 	defer lister.Close()
 
 	dirTree := r.URL.Query().Get("dirtree") == "1"
-	dataGetter := func(limit, _ int) ([]byte, int, error) {
-		contents, err := lister.Next(limit)
-		if errors.Is(err, io.EOF) {
-			err = nil
-		}
+	dataGetter := func(limit, offset int) ([]byte, int, error) {
+		contents, finished, err := nextRenderableEntries(lister, limit, func(info os.FileInfo) bool {
+			return info.IsDir() || !dirTree
+		})
 		if err != nil {
 			return nil, 0, err
 		}
 		results := make([]map[string]any, 0, len(contents))
-		for _, info := range contents {
+		for idx, info := range contents {
 			res := make(map[string]any)
+			res["id"] = offset + idx + 1
 			res["url"] = getFileObjectURL(name, info.Name(), webClientFilesPath)
 			if info.IsDir() {
 				res["type"] = "1"
 				res["size"] = ""
 				res["dir_path"] = url.QueryEscape(path.Join(name, info.Name()))
 			} else {
-				if dirTree {
-					continue
-				}
 				res["type"] = "2"
 				if info.Mode()&os.ModeSymlink != 0 {
 					res["size"] = ""
@@ -1254,8 +1290,8 @@ func (s *httpdServer) handleClientGetDirContents(w http.ResponseWriter, r *http.
 		}
 		data, err := json.Marshal(results)
 		count := limit
-		if len(results) == 0 {
-			count = 0
+		if finished {
+			count = len(results)
 		}
 		return data, count, err
 	}
@@ -1265,7 +1301,7 @@ func (s *httpdServer) handleClientGetDirContents(w http.ResponseWriter, r *http.
 
 func (s *httpdServer) handleClientGetFiles(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestSize)
-	claims, err := getTokenClaims(r)
+	claims, err := jwt.FromContext(r.Context())
 	if err != nil || claims.Username == "" {
 		s.renderClientForbiddenPage(w, r, util.NewI18nError(errInvalidTokenClaims, util.I18nErrorInvalidToken))
 		return
@@ -1285,11 +1321,8 @@ func (s *httpdServer) handleClientGetFiles(w http.ResponseWriter, r *http.Reques
 		s.renderClientForbiddenPage(w, r, err)
 		return
 	}
-	connection := &Connection{
-		BaseConnection: common.NewBaseConnection(connID, protocol, util.GetHTTPLocalAddress(r),
-			r.RemoteAddr, user),
-		request: r,
-	}
+	baseConn := common.NewBaseConnection(connID, protocol, util.GetHTTPLocalAddress(r), r.RemoteAddr, user)
+	connection := newConnection(baseConn, w, r)
 	if err = common.Connections.Add(connection); err != nil {
 		s.renderClientMessagePage(w, r, util.I18nError429Title, http.StatusTooManyRequests,
 			util.NewI18nError(err, util.I18nError429Message), "")
@@ -1326,7 +1359,7 @@ func (s *httpdServer) handleClientGetFiles(w http.ResponseWriter, r *http.Reques
 
 func (s *httpdServer) handleClientEditFile(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestSize)
-	claims, err := getTokenClaims(r)
+	claims, err := jwt.FromContext(r.Context())
 	if err != nil || claims.Username == "" {
 		s.renderClientForbiddenPage(w, r, util.NewI18nError(errInvalidTokenClaims, util.I18nErrorInvalidToken))
 		return
@@ -1346,11 +1379,8 @@ func (s *httpdServer) handleClientEditFile(w http.ResponseWriter, r *http.Reques
 		s.renderClientForbiddenPage(w, r, err)
 		return
 	}
-	connection := &Connection{
-		BaseConnection: common.NewBaseConnection(connID, protocol, util.GetHTTPLocalAddress(r),
-			r.RemoteAddr, user),
-		request: r,
-	}
+	baseConn := common.NewBaseConnection(connID, protocol, util.GetHTTPLocalAddress(r), r.RemoteAddr, user)
+	connection := newConnection(baseConn, w, r)
 	if err = common.Connections.Add(connection); err != nil {
 		s.renderClientMessagePage(w, r, util.I18nError429Title, http.StatusTooManyRequests,
 			util.NewI18nError(err, util.I18nError429Message), "")
@@ -1383,7 +1413,7 @@ func (s *httpdServer) handleClientEditFile(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	connection.User.CheckFsRoot(connection.ID) //nolint:errcheck
+	_ = connection.User.CheckFsRoot(connection.ID)
 	reader, err := connection.getFileReader(name, 0, r.Method)
 	if err != nil {
 		s.renderClientMessagePage(w, r, util.I18nErrorEditorTitle, getRespStatus(err),
@@ -1405,7 +1435,7 @@ func (s *httpdServer) handleClientEditFile(w http.ResponseWriter, r *http.Reques
 
 func (s *httpdServer) handleClientAddShareGet(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestSize)
-	claims, err := getTokenClaims(r)
+	claims, err := jwt.FromContext(r.Context())
 	if err != nil || claims.Username == "" {
 		s.renderClientForbiddenPage(w, r, util.NewI18nError(errInvalidTokenClaims, util.I18nErrorInvalidToken))
 		return
@@ -1447,7 +1477,7 @@ func (s *httpdServer) handleClientAddShareGet(w http.ResponseWriter, r *http.Req
 
 func (s *httpdServer) handleClientUpdateShareGet(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestSize)
-	claims, err := getTokenClaims(r)
+	claims, err := jwt.FromContext(r.Context())
 	if err != nil || claims.Username == "" {
 		s.renderClientForbiddenPage(w, r, util.NewI18nError(errInvalidTokenClaims, util.I18nErrorInvalidToken))
 		return
@@ -1465,7 +1495,7 @@ func (s *httpdServer) handleClientUpdateShareGet(w http.ResponseWriter, r *http.
 
 func (s *httpdServer) handleClientAddSharePost(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestSize)
-	claims, err := getTokenClaims(r)
+	claims, err := jwt.FromContext(r.Context())
 	if err != nil || claims.Username == "" {
 		s.renderClientForbiddenPage(w, r, util.NewI18nError(errInvalidTokenClaims, util.I18nErrorInvalidToken))
 		return
@@ -1524,7 +1554,7 @@ func (s *httpdServer) handleClientAddSharePost(w http.ResponseWriter, r *http.Re
 
 func (s *httpdServer) handleClientUpdateSharePost(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestSize)
-	claims, err := getTokenClaims(r)
+	claims, err := jwt.FromContext(r.Context())
 	if err != nil || claims.Username == "" {
 		s.renderClientForbiddenPage(w, r, util.NewI18nError(errInvalidTokenClaims, util.I18nErrorInvalidToken))
 		return
@@ -1593,7 +1623,7 @@ func (s *httpdServer) handleClientUpdateSharePost(w http.ResponseWriter, r *http
 
 func getAllShares(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestSize)
-	claims, err := getTokenClaims(r)
+	claims, err := jwt.FromContext(r.Context())
 	if err != nil || claims.Username == "" {
 		sendAPIResponse(w, r, nil, util.I18nErrorInvalidToken, http.StatusForbidden)
 		return
@@ -1617,6 +1647,7 @@ func (s *httpdServer) handleClientGetShares(w http.ResponseWriter, r *http.Reque
 	data := clientSharesPage{
 		baseClientPage:      s.getBaseClientPageData(util.I18nSharesTitle, webClientSharesPath, w, r),
 		BasePublicSharesURL: webClientPubSharesPath,
+		BaseURL:             s.binding.BaseURL,
 	}
 	renderClientTemplate(w, templateClientShares, data)
 }
@@ -1631,7 +1662,7 @@ func (s *httpdServer) handleWebClientChangePwd(w http.ResponseWriter, r *http.Re
 	s.renderClientChangePasswordPage(w, r, nil)
 }
 
-func (s *httpdServer) handleWebClientProfilePost(w http.ResponseWriter, r *http.Request) { //nolint:gocyclo
+func (s *httpdServer) handleWebClientProfilePost(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestSize)
 	err := r.ParseForm()
 	if err != nil {
@@ -1643,7 +1674,7 @@ func (s *httpdServer) handleWebClientProfilePost(w http.ResponseWriter, r *http.
 		s.renderClientForbiddenPage(w, r, util.NewI18nError(err, util.I18nErrorInvalidCSRF))
 		return
 	}
-	claims, err := getTokenClaims(r)
+	claims, err := jwt.FromContext(r.Context())
 	if err != nil || claims.Username == "" {
 		s.renderClientForbiddenPage(w, r, util.NewI18nError(errInvalidTokenClaims, util.I18nErrorInvalidToken))
 		return
@@ -1817,7 +1848,7 @@ func (s *httpdServer) handleClientViewPDF(w http.ResponseWriter, r *http.Request
 
 func (s *httpdServer) handleClientGetPDF(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxLoginBodySize)
-	claims, err := getTokenClaims(r)
+	claims, err := jwt.FromContext(r.Context())
 	if err != nil || claims.Username == "" {
 		s.renderClientForbiddenPage(w, r, util.NewI18nError(errInvalidTokenClaims, util.I18nErrorInvalidToken))
 		return
@@ -1842,11 +1873,8 @@ func (s *httpdServer) handleClientGetPDF(w http.ResponseWriter, r *http.Request)
 		s.renderClientForbiddenPage(w, r, err)
 		return
 	}
-	connection := &Connection{
-		BaseConnection: common.NewBaseConnection(connID, protocol, util.GetHTTPLocalAddress(r),
-			r.RemoteAddr, user),
-		request: r,
-	}
+	baseConn := common.NewBaseConnection(connID, protocol, util.GetHTTPLocalAddress(r), r.RemoteAddr, user)
+	connection := newConnection(baseConn, w, r)
 	if err = common.Connections.Add(connection); err != nil {
 		s.renderClientMessagePage(w, r, util.I18nError429Title, http.StatusTooManyRequests,
 			util.NewI18nError(err, util.I18nError429Message), "")
@@ -1864,11 +1892,11 @@ func (s *httpdServer) handleClientGetPDF(w http.ResponseWriter, r *http.Request)
 		s.renderClientBadRequestPage(w, r, util.NewI18nError(fmt.Errorf("%q is not a file", name), util.I18nErrorPDFMessage))
 		return
 	}
-	connection.User.CheckFsRoot(connection.ID) //nolint:errcheck
+	_ = connection.User.CheckFsRoot(connection.ID)
 	if err := s.ensurePDF(w, r, name, connection); err != nil {
 		return
 	}
-	downloadFile(w, r, connection, name, info, true, nil) //nolint:errcheck
+	_, _ = downloadFile(w, r, connection, name, info, true, nil)
 }
 
 func (s *httpdServer) ensurePDF(w http.ResponseWriter, r *http.Request, name string, connection *Connection) error {
@@ -1912,7 +1940,7 @@ func (s *httpdServer) handleClientShareLoginPost(w http.ResponseWriter, r *http.
 		s.renderShareLoginPage(w, r, util.NewI18nError(err, util.I18nErrorInvalidCSRF))
 		return
 	}
-	invalidateToken(r)
+	_ = invalidateToken(r) // best effort: invalidates the pre-login token
 	shareID := getURLParam(r, "id")
 	share, err := dataprovider.ShareExists(shareID, "")
 	if err != nil {
@@ -1921,19 +1949,21 @@ func (s *httpdServer) handleClientShareLoginPost(w http.ResponseWriter, r *http.
 	}
 	match, err := share.CheckCredentials(strings.TrimSpace(r.Form.Get("share_password")))
 	if !match || err != nil {
+		_ = handleDefenderEventLoginFailed(ipAddr, dataprovider.ErrInvalidCredentials)
 		s.renderShareLoginPage(w, r, util.NewI18nError(dataprovider.ErrInvalidCredentials, util.I18nErrorInvalidCredentials))
 		return
 	}
 	next := path.Clean(r.URL.Query().Get("next"))
 	baseShareURL := path.Join(webClientPubSharesPath, share.ShareID)
 	isRedirect, redirectTo := checkShareRedirectURL(next, baseShareURL)
-	c := jwtTokenClaims{
+	c := &jwt.Claims{
 		Username: shareID,
 	}
+	c.Subject = share.GetSignature()
 	if isRedirect {
 		c.Ref = next
 	}
-	err = c.createAndSetCookie(w, r, s.tokenAuth, tokenAudienceWebShare, ipAddr)
+	err = createAndSetCookie(w, r, c, s.tokenAuth, tokenAudienceWebShare, ipAddr)
 	if err != nil {
 		s.renderShareLoginPage(w, r, util.NewI18nError(err, util.I18nError500Message))
 		return
@@ -1964,10 +1994,12 @@ func (s *httpdServer) handleClientShareLogout(w http.ResponseWriter, r *http.Req
 func (s *httpdServer) handleClientSharedFile(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestSize)
 	validScopes := []dataprovider.ShareScope{dataprovider.ShareScopeRead}
-	share, _, err := s.checkPublicShare(w, r, validScopes)
+	share, connection, err := s.checkPublicShare(w, r, validScopes)
 	if err != nil {
 		return
 	}
+	defer connection.CloseFS()
+
 	query := ""
 	if r.URL.RawQuery != "" {
 		query = "?" + r.URL.RawQuery
@@ -1995,6 +2027,8 @@ func (s *httpdServer) handleClientShareCheckExist(w http.ResponseWriter, r *http
 	if err != nil {
 		return
 	}
+	defer connection.CloseFS()
+
 	if err := validateBrowsableShare(share, connection); err != nil {
 		sendAPIResponse(w, r, err, "", getRespStatus(err))
 		return
@@ -2037,33 +2071,34 @@ func doCheckExist(w http.ResponseWriter, r *http.Request, connection *Connection
 	}
 	defer lister.Close()
 
+	found := 0
 	dataGetter := func(limit, _ int) ([]byte, int, error) {
-		contents, err := lister.Next(limit)
-		if errors.Is(err, io.EOF) {
-			err = nil
-		}
+		contents, finished, err := nextRenderableEntries(lister, limit, func(info os.FileInfo) bool {
+			return slices.Contains(filesList.Files, info.Name())
+		})
 		if err != nil {
 			return nil, 0, err
 		}
-		existing := make([]map[string]any, 0)
+		existing := make([]map[string]any, 0, len(contents))
 		for _, info := range contents {
-			if slices.Contains(filesList.Files, info.Name()) {
-				res := make(map[string]any)
-				res["name"] = info.Name()
-				if info.IsDir() {
-					res["type"] = "1"
-					res["size"] = ""
-				} else {
-					res["type"] = "2"
-					res["size"] = info.Size()
-				}
-				existing = append(existing, res)
+			res := make(map[string]any)
+			res["name"] = info.Name()
+			if info.IsDir() {
+				res["type"] = "1"
+				res["size"] = ""
+			} else {
+				res["type"] = "2"
+				res["size"] = info.Size()
 			}
+			existing = append(existing, res)
 		}
+		found += len(existing)
 		data, err := json.Marshal(existing)
 		count := limit
-		if len(existing) == 0 {
-			count = 0
+		// proving that a name is missing requires the whole listing, finding
+		// every checked one does not
+		if finished || found >= len(filesList.Files) {
+			count = len(existing)
 		}
 		return data, count, err
 	}
@@ -2072,30 +2107,19 @@ func doCheckExist(w http.ResponseWriter, r *http.Request, connection *Connection
 }
 
 func checkShareRedirectURL(next, base string) (bool, string) {
-	if !strings.HasPrefix(next, base) {
+	u := safeRedirectURL(next, base)
+	if u == nil {
 		return false, ""
 	}
-	if next == base {
-		return true, path.Join(next, "download")
+	if u.Path == base {
+		u.Path = path.Join(base, "download")
 	}
-	baseURL, err := url.Parse(base)
-	if err != nil {
-		return false, ""
-	}
-	nextURL, err := url.Parse(next)
-	if err != nil {
-		return false, ""
-	}
-	if nextURL.Path == baseURL.Path {
-		redirectURL := nextURL.JoinPath("download")
-		return true, redirectURL.String()
-	}
-	return true, next
+	return true, u.String()
 }
 
 func getWebTask(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxLoginBodySize)
-	claims, err := getTokenClaims(r)
+	claims, err := jwt.FromContext(r.Context())
 	if err != nil || claims.Username == "" {
 		sendAPIResponse(w, r, err, "Invalid token claims", http.StatusBadRequest)
 		return

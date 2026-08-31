@@ -36,6 +36,17 @@ import (
 type Connection struct {
 	*common.BaseConnection
 	request *http.Request
+	rc      *http.ResponseController
+}
+
+func newConnection(conn *common.BaseConnection, w http.ResponseWriter, r *http.Request) *Connection {
+	rc := http.NewResponseController(w)
+	responseControllerDeadlines(rc, time.Time{}, time.Time{})
+	return &Connection{
+		BaseConnection: conn,
+		request:        r,
+		rc:             rc,
+	}
 }
 
 func (c *Connection) getModificationTime() time.Time {
@@ -73,6 +84,9 @@ func (c *Connection) GetRemoteAddress() string {
 
 // Disconnect closes the active transfer
 func (c *Connection) Disconnect() error {
+	if c.rc != nil {
+		responseControllerDeadlines(c.rc, time.Now().Add(5*time.Second), time.Now().Add(5*time.Second))
+	}
 	return c.SignalTransfersAbort()
 }
 
@@ -89,7 +103,7 @@ func (c *Connection) Mkdir(_ context.Context, name string, _ os.FileMode) error 
 	c.UpdateLastActivity()
 
 	name = util.CleanPath(name)
-	return c.CreateDir(name, true)
+	return c.CreateDir(name)
 }
 
 // Rename renames a file or a directory
@@ -145,7 +159,7 @@ func (c *Connection) RemoveAll(_ context.Context, name string) error {
 func (c *Connection) OpenFile(_ context.Context, name string, flag int, _ os.FileMode) (webdav.File, error) {
 	c.UpdateLastActivity()
 
-	if err := common.Connections.IsNewTransferAllowed(c.User.Username); err != nil {
+	if err := common.Connections.IsNewTransferAllowed(c.BaseConnection); err != nil {
 		c.Log(logger.LevelInfo, "denying transfer due to count limits")
 		return nil, c.GetPermissionDeniedError()
 	}
@@ -279,7 +293,7 @@ func (c *Connection) handleUploadToExistingFile(fs vfs.Fs, resolvedPath, filePat
 		if err == nil {
 			dataprovider.UpdateUserFolderQuota(&vfolder, &c.User, 0, -fileSize, false)
 		} else {
-			dataprovider.UpdateUserQuota(&c.User, 0, -fileSize, false) //nolint:errcheck
+			_ = dataprovider.UpdateUserQuota(&c.User, 0, -fileSize, false)
 		}
 	} else {
 		initialSize = fileSize

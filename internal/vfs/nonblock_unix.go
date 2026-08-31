@@ -12,24 +12,12 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-//go:build !windows
+//go:build unix
 
-package sftpd
+package vfs
 
-import (
-	"os/exec"
-	"testing"
+import "syscall"
 
-	"github.com/stretchr/testify/assert"
-)
-
-func TestWrapCmd(t *testing.T) {
-	cmd := exec.Command("ls")
-	cmd = wrapCmd(cmd, 3001, 3002)
-	assert.Equal(t, uint32(3001), cmd.SysProcAttr.Credential.Uid)
-	assert.Equal(t, uint32(3002), cmd.SysProcAttr.Credential.Gid)
-
-	cmd = exec.Command("cd")
-	cmd = wrapCmd(cmd, processUID, processGID)
-	assert.Nil(t, cmd.SysProcAttr)
+func withNonBlock(flag int) int {
+	return flag | syscall.O_NONBLOCK
 }

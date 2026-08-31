@@ -94,6 +94,7 @@ const (
 	I18nErrorDirList429                = "fs.dir_list.err_429"
 	I18nErrorDirListUser               = "fs.dir_list.err_user"
 	I18nErrorFsValidation              = "fs.err_validation"
+	I18nErrorSecretEntropy             = "fs.err_secret_entropy"
 	I18nErrorChangePwdRequiredFields   = "change_pwd.required_fields"
 	I18nErrorChangePwdNoMatch          = "change_pwd.no_match"
 	I18nErrorChangePwdGeneric          = "change_pwd.generic"
@@ -105,7 +106,6 @@ const (
 	I18nErrorPermissionsRequired       = "general.permissions_required"
 	I18nErrorGetUser                   = "general.err_user"
 	I18nErrorPwdResetForbidded         = "login.reset_pwd_forbidden"
-	I18nErrorPwdResetNoEmail           = "login.reset_pwd_no_email"
 	I18nErrorPwdResetSendEmail         = "login.reset_pwd_send_email_err"
 	I18nErrorPwdResetGeneric           = "login.reset_pwd_err_generic"
 	I18nErrorProtocolForbidden         = "general.err_protocol_forbidden"
@@ -114,6 +114,7 @@ const (
 	I18nErrorConnectionForbidden       = "general.connection_forbidden"
 	I18nErrorReservedUsername          = "user.username_reserved"
 	I18nErrorInvalidEmail              = "general.email_invalid"
+	I18nErrorInvalidInput              = "general.invalid_input"
 	I18nErrorInvalidUser               = "user.username_invalid"
 	I18nErrorInvalidName               = "general.name_invalid"
 	I18nErrorHomeRequired              = "user.home_required"
@@ -133,6 +134,7 @@ const (
 	I18nErrorFolderMountPathRequired   = "user.folder_path_required"
 	I18nErrorDuplicatedFolders         = "user.folder_duplicated"
 	I18nErrorOverlappedFolders         = "user.folder_overlapped"
+	I18nErrorFolderQuotaMismatch       = "user.folder_quota_mismatch"
 	I18nErrorFolderQuotaSizeInvalid    = "user.folder_quota_size_invalid"
 	I18nErrorFolderQuotaFileInvalid    = "user.folder_quota_file_invalid"
 	I18nErrorFolderQuotaInvalid        = "user.folder_quota_invalid"
@@ -372,7 +374,7 @@ func (e *I18nError) Args() string {
 	if len(e.args) > 0 {
 		data, err := json.Marshal(e.args)
 		if err == nil {
-			return BytesToString(data)
+			return string(data)
 		}
 	}
 	return "{}"

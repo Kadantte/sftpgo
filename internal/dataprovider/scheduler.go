@@ -84,11 +84,14 @@ func addScheduledCacheUpdates() error {
 
 func checkDataprovider() {
 	if currentNode != nil {
-		if err := provider.updateNodeTimestamp(); err != nil {
+		err := provider.updateNodeTimestamp()
+		if err != nil {
 			providerLog(logger.LevelError, "unable to update node timestamp: %v", err)
 		} else {
 			providerLog(logger.LevelDebug, "node timestamp updated")
 		}
+		metric.UpdateDataProviderAvailability(err)
+		return
 	}
 	err := provider.checkAvailability()
 	if err != nil {
@@ -124,7 +127,7 @@ func checkUserCache() {
 			deletedAt := util.GetTimeFromMsecSinceEpoch(user.DeletedAt)
 			if deletedAt.Add(30 * time.Minute).Before(time.Now()) {
 				providerLog(logger.LevelDebug, "removing user %q deleted at %s", user.Username, deletedAt)
-				go provider.deleteUser(user, false) //nolint:errcheck
+				go func() { _ = provider.deleteUser(user, false) }()
 			}
 			webDAVUsersCache.remove(user.Username)
 			cachedUserPasswords.Remove(user.Username)
@@ -165,7 +168,7 @@ func checkIPListEntryCache() {
 			deletedAt := util.GetTimeFromMsecSinceEpoch(e.DeletedAt)
 			if deletedAt.Add(30 * time.Minute).Before(time.Now()) {
 				providerLog(logger.LevelDebug, "removing IP list entry %q deleted at %s", e.getName(), deletedAt)
-				go provider.deleteIPListEntry(e, false) //nolint:errcheck
+				go func() { _ = provider.deleteIPListEntry(e, false) }()
 			}
 			for _, l := range inMemoryLists {
 				l.removeEntry(&e)

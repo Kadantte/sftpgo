@@ -28,6 +28,7 @@ import (
 	"github.com/drakkan/sftpgo/v2/internal/config"
 	"github.com/drakkan/sftpgo/v2/internal/dataprovider"
 	"github.com/drakkan/sftpgo/v2/internal/httpd"
+	"github.com/drakkan/sftpgo/v2/internal/kms"
 	"github.com/drakkan/sftpgo/v2/internal/logger"
 	"github.com/drakkan/sftpgo/v2/internal/plugin"
 	"github.com/drakkan/sftpgo/v2/internal/util"
@@ -39,7 +40,6 @@ const (
 )
 
 var (
-	chars     = []rune("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789")
 	graceTime int
 )
 
@@ -89,12 +89,20 @@ func (s *Service) initLogger() {
 }
 
 // Start initializes and starts the service
-func (s *Service) Start(disableAWSInstallationCode bool) error {
+func (s *Service) Start() error {
 	s.initLogger()
 	logger.Info(logSender, "", "starting SFTPGo %s, config dir: %s, config file: %s, log max size: %d log max backups: %d "+
 		"log max age: %d log level: %s, log compress: %t, log utc time: %t, load data from: %q, grace time: %d secs",
 		version.GetAsString(), s.ConfigDir, s.ConfigFile, s.LogMaxSize, s.LogMaxBackups, s.LogMaxAge, s.LogLevel,
 		s.LogCompress, s.LogUTCTime, s.LoadDataFrom, graceTime)
+	if os.Geteuid() == 0 {
+		// os.Geteuid returns -1 on Windows.
+		const warnString = "running with an effective uid of 0: file operations, hooks and external commands " +
+			"are executed with root privileges, the only boundary between users is SFTPGo's own permission " +
+			"model. Running the service under a dedicated unprivileged account is recommended"
+		logger.Warn(logSender, "", "%s", warnString)
+		logger.WarnToConsole("%s", warnString)
+	}
 	// in portable mode we don't read configuration from file
 	if s.PortableMode != 1 {
 		err := config.LoadConfig(s.ConfigDir, s.ConfigFile)
@@ -110,17 +118,17 @@ func (s *Service) Start(disableAWSInstallationCode bool) error {
 		return errors.New(infoString)
 	}
 
-	if err := s.initializeServices(disableAWSInstallationCode); err != nil {
+	if err := s.initializeServices(); err != nil {
 		return err
 	}
 
 	s.startServices()
-	go common.Config.ExecuteStartupHook() //nolint:errcheck
+	go func() { _ = common.Config.ExecuteStartupHook() }()
 
 	return nil
 }
 
-func (s *Service) initializeServices(disableAWSInstallationCode bool) error {
+func (s *Service) initializeServices() error {
 	providerConf := config.GetProviderConf()
 	kmsConfig := config.GetKMSConfig()
 	err := kmsConfig.Initialize()
@@ -134,6 +142,11 @@ func (s *Service) initializeServices(disableAWSInstallationCode bool) error {
 	if err := plugin.Initialize(config.GetPluginsConfig(), s.LogLevel); err != nil {
 		logger.Error(logSender, "", "unable to initialize plugin system: %v", err)
 		logger.ErrorToConsole("unable to initialize plugin system: %v", err)
+		return err
+	}
+	if err := kms.CheckProviderAvailable(); err != nil {
+		logger.Error(logSender, "", "unable to initialize KMS: %v", err)
+		logger.ErrorToConsole("unable to initialize KMS: %v", err)
 		return err
 	}
 	mfaConfig := config.GetMFAConfig()
@@ -178,12 +191,6 @@ func (s *Service) initializeServices(disableAWSInstallationCode bool) error {
 			logger.ErrorToConsole("error initializing ACME configuration: %v", err)
 			return err
 		}
-	}
-
-	if err := registerAWSContainer(disableAWSInstallationCode); err != nil {
-		logger.Error(logSender, "", "error registering AWS container: %v", err)
-		logger.ErrorToConsole("error registering AWS container: %v", err)
-		return err
 	}
 
 	httpConfig := config.GetHTTPConfig()

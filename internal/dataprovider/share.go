@@ -18,6 +18,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -94,17 +96,19 @@ func (s *Share) IsPasswordHashed() bool {
 	return util.IsStringPrefixInSlice(s.Password, hashPwdPrefixes)
 }
 
-func (s *Share) getACopy() Share {
-	allowFrom := make([]string, len(s.AllowFrom))
-	copy(allowFrom, s.AllowFrom)
+// GetSignature returns a value that changes whenever the share is updated.
+func (s *Share) GetSignature() string {
+	return strconv.FormatInt(s.UpdatedAt, 10)
+}
 
+func (s *Share) getACopy() Share {
 	return Share{
 		ID:          s.ID,
 		ShareID:     s.ShareID,
 		Name:        s.Name,
 		Description: s.Description,
 		Scope:       s.Scope,
-		Paths:       s.Paths,
+		Paths:       slices.Clone(s.Paths),
 		Username:    s.Username,
 		CreatedAt:   s.CreatedAt,
 		UpdatedAt:   s.UpdatedAt,
@@ -113,7 +117,7 @@ func (s *Share) getACopy() Share {
 		Password:    s.Password,
 		MaxTokens:   s.MaxTokens,
 		UsedTokens:  s.UsedTokens,
-		AllowFrom:   allowFrom,
+		AllowFrom:   slices.Clone(s.AllowFrom),
 	}
 }
 
@@ -146,7 +150,7 @@ func (s *Share) HasRedactedPassword() bool {
 
 func (s *Share) hashPassword() error {
 	if s.Password != "" && !util.IsStringPrefixInSlice(s.Password, internalHashPwdPrefixes) {
-		user, err := UserExists(s.Username, "")
+		user, err := GetUserWithGroupSettings(s.Username, "")
 		if err != nil {
 			return util.NewGenericError(fmt.Sprintf("unable to validate user: %v", err))
 		}
@@ -160,7 +164,7 @@ func (s *Share) hashPassword() error {
 			if err != nil {
 				return err
 			}
-			s.Password = util.BytesToString(hashed)
+			s.Password = string(hashed)
 		} else {
 			hashed, err := argon2id.CreateHash(s.Password, argon2Params)
 			if err != nil {
@@ -212,6 +216,9 @@ func (s *Share) validate() error {
 	}
 	if s.Name == "" {
 		return util.NewI18nError(util.NewValidationError("name is mandatory"), util.I18nErrorNameRequired)
+	}
+	if !util.IsNameValid(s.Name) {
+		return util.NewI18nError(errInvalidInput, util.I18nErrorInvalidInput)
 	}
 	if s.Scope < ShareScopeRead || s.Scope > ShareScopeReadWrite {
 		return util.NewI18nError(util.NewValidationError(fmt.Sprintf("invalid scope: %v", s.Scope)), util.I18nErrorShareScope)
@@ -283,7 +290,7 @@ func (s *Share) GetRelativePath(name string) string {
 // IsUsable checks if the share is usable from the specified IP
 func (s *Share) IsUsable(ip string) (bool, error) {
 	if s.MaxTokens > 0 && s.UsedTokens >= s.MaxTokens {
-		return false, util.NewI18nError(util.NewRecordNotFoundError("max share usage exceeded"), util.I18nErrorShareUsage)
+		return false, ErrShareUsageExceeded
 	}
 	if s.ExpiresAt > 0 {
 		if s.ExpiresAt < util.GetTimeAsMsSinceEpoch(time.Now()) {

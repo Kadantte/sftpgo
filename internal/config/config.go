@@ -120,6 +120,7 @@ var (
 		ClientIPHeaderDepth:  0,
 		HideLoginURL:         0,
 		RenderOpenAPI:        true,
+		BaseURL:              "",
 		Languages:            []string{"en"},
 		OIDC: httpd.OIDC{
 			ClientID:                   "",
@@ -132,6 +133,7 @@ var (
 			ImplicitRoles:              false,
 			Scopes:                     []string{"openid", "profile", "email"},
 			CustomFields:               []string{},
+			QueryUserInfo:              false,
 			InsecureSkipSignatureCheck: false,
 			Debug:                      false,
 		},
@@ -210,8 +212,9 @@ func Init() {
 			},
 			SetstatMode:           0,
 			RenameMode:            0,
+			SymlinkMode:           0,
 			ResumeMaxSize:         0,
-			TempPath:              "",
+			SecretMinEntropy:      80,
 			ProxyProtocol:         0,
 			ProxyAllowed:          []string{},
 			ProxySkipped:          []string{},
@@ -273,12 +276,13 @@ func Init() {
 			HostCertificates:                  []string{},
 			HostKeyAlgorithms:                 []string{},
 			KexAlgorithms:                     []string{},
-			MinDHGroupExchangeKeySize:         2048,
 			Ciphers:                           []string{},
 			MACs:                              []string{},
 			PublicKeyAlgorithms:               []string{},
 			TrustedUserCAKeys:                 []string{},
 			RevokedUserCertsFile:              "",
+			OPKSSHPath:                        "",
+			OPKSSHChecksum:                    "",
 			LoginBannerFile:                   "",
 			EnabledSSHCommands:                []string{},
 			KeyboardInteractiveAuthentication: true,
@@ -339,6 +343,7 @@ func Init() {
 			Port:               0,
 			Username:           "",
 			Password:           "",
+			PasswordFile:       "",
 			ConnectionString:   "",
 			SQLTablesPrefix:    "",
 			SSLMode:            0,
@@ -385,7 +390,7 @@ func Init() {
 			UpdateMode:         0,
 			DelayedQuotaUpdate: 0,
 			CreateDefaultAdmin: false,
-			NamingRules:        1,
+			NamingRules:        5,
 			IsShared:           0,
 			Node: dataprovider.NodeConfig{
 				Host:  "",
@@ -660,6 +665,7 @@ func getRedactedGlobalConf() globalConfig {
 		binding.OIDC.ClientSecret = getRedactedPassword(binding.OIDC.ClientSecret)
 		conf.HTTPDConfig.Bindings = append(conf.HTTPDConfig.Bindings, binding)
 	}
+	conf.KMSConfig.Secrets.MasterKeyString = getRedactedPassword(conf.KMSConfig.Secrets.MasterKeyString)
 	conf.PluginsConfig = nil
 	for _, plugin := range globalConf.PluginsConfig {
 		var args []string
@@ -831,10 +837,16 @@ func resetInvalidConfigs() {
 		logger.Warn(logSender, "", "Non-fatal configuration error: %v", warn)
 		logger.WarnToConsole("Non-fatal configuration error: %v", warn)
 	}
+	if globalConf.Common.SymlinkMode < 0 || globalConf.Common.SymlinkMode > 3 {
+		warn := fmt.Sprintf("invalid symlink mode %d, reset to 0", globalConf.Common.SymlinkMode)
+		globalConf.Common.SymlinkMode = 0
+		logger.Warn(logSender, "", "Non-fatal configuration error: %v", warn)
+		logger.WarnToConsole("Non-fatal configuration error: %v", warn)
+	}
 }
 
 func loadBindingsFromEnv() {
-	for idx := 0; idx < 10; idx++ {
+	for idx := range 10 {
 		getTOTPFromEnv(idx)
 		getRateLimitersFromEnv(idx)
 		getPluginsFromEnv(idx)
@@ -1141,7 +1153,7 @@ func getFTPDPassiveIPOverridesFromEnv(idx int) []ftpd.PassiveIPOverride {
 		overrides = globalConf.FTPD.Bindings[idx].PassiveIPOverrides
 	}
 
-	for subIdx := 0; subIdx < 10; subIdx++ {
+	for subIdx := range 10 {
 		var override ftpd.PassiveIPOverride
 		var replace bool
 		if len(globalConf.FTPD.Bindings) > idx && len(globalConf.FTPD.Bindings[idx].PassiveIPOverrides) > subIdx {
@@ -1201,12 +1213,6 @@ func getFTPDBindingSecurityFromEnv(idx int, binding *ftpd.Binding) bool {
 		isSet = true
 	}
 
-	tlsSessionReuse, ok := lookupIntFromEnv(fmt.Sprintf("SFTPGO_FTPD__BINDINGS__%v__TLS_SESSION_REUSE", idx), 32)
-	if ok {
-		binding.TLSSessionReuse = int(tlsSessionReuse)
-		isSet = true
-	}
-
 	tlsVer, ok := lookupIntFromEnv(fmt.Sprintf("SFTPGO_FTPD__BINDINGS__%v__MIN_TLS_VERSION", idx), 32)
 	if ok {
 		binding.MinTLSVersion = int(tlsVer)
@@ -1234,12 +1240,6 @@ func getFTPDBindingSecurityFromEnv(idx int, binding *ftpd.Binding) bool {
 	activeSecurity, ok := lookupIntFromEnv(fmt.Sprintf("SFTPGO_FTPD__BINDINGS__%v__ACTIVE_CONNECTIONS_SECURITY", idx), 32)
 	if ok {
 		binding.ActiveConnectionsSecurity = int(activeSecurity)
-		isSet = true
-	}
-
-	ignoreASCIITransferType, ok := lookupIntFromEnv(fmt.Sprintf("SFTPGO_FTPD__BINDINGS__%d__IGNORE_ASCII_TRANSFER_TYPE", idx), 32)
-	if ok {
-		binding.IgnoreASCIITransferType = int(ignoreASCIITransferType)
 		isSet = true
 	}
 
@@ -1388,7 +1388,7 @@ func getWebDAVDBindingProxyConfigsFromEnv(idx int, binding *webdavd.Binding) boo
 }
 
 func loadWebDAVCacheMappingsFromEnv() []webdavd.CustomMimeMapping {
-	for idx := 0; idx < 30; idx++ {
+	for idx := range 30 {
 		ext, extOK := os.LookupEnv(fmt.Sprintf("SFTPGO_WEBDAVD__CACHE__MIME_TYPES__CUSTOM_MAPPINGS__%d__EXT", idx))
 		mime, mimeOK := os.LookupEnv(fmt.Sprintf("SFTPGO_WEBDAVD__CACHE__MIME_TYPES__CUSTOM_MAPPINGS__%d__MIME", idx))
 		if extOK && mimeOK {
@@ -1463,7 +1463,7 @@ func getHTTPDSecurityProxyHeadersFromEnv(idx int) []httpd.HTTPSProxyHeader {
 		httpsProxyHeaders = globalConf.HTTPDConfig.Bindings[idx].Security.HTTPSProxyHeaders
 	}
 
-	for subIdx := 0; subIdx < 10; subIdx++ {
+	for subIdx := range 10 {
 		var httpsProxyHeader httpd.HTTPSProxyHeader
 		var replace bool
 		if len(globalConf.HTTPDConfig.Bindings) > idx &&
@@ -1492,7 +1492,7 @@ func getHTTPDSecurityProxyHeadersFromEnv(idx int) []httpd.HTTPSProxyHeader {
 	return httpsProxyHeaders
 }
 
-func getHTTPDSecurityConfFromEnv(idx int) (httpd.SecurityConf, bool) { //nolint:gocyclo
+func getHTTPDSecurityConfFromEnv(idx int) (httpd.SecurityConf, bool) {
 	result := defaultHTTPDBinding.Security
 	if len(globalConf.HTTPDConfig.Bindings) > idx {
 		result = globalConf.HTTPDConfig.Bindings[idx].Security
@@ -1677,6 +1677,12 @@ func getHTTPDOIDCFromEnv(idx int) (httpd.OIDC, bool) {
 		isSet = true
 	}
 
+	queryUserInfo, ok := lookupBoolFromEnv(fmt.Sprintf("SFTPGO_HTTPD__BINDINGS__%v__OIDC__QUERY_USERINFO", idx))
+	if ok {
+		result.QueryUserInfo = queryUserInfo
+		isSet = true
+	}
+
 	skipSignatureCheck, ok := lookupBoolFromEnv(fmt.Sprintf("SFTPGO_HTTPD__BINDINGS__%v__OIDC__INSECURE_SKIP_SIGNATURE_CHECK", idx))
 	if ok {
 		result.InsecureSkipSignatureCheck = skipSignatureCheck
@@ -1832,7 +1838,7 @@ func getHTTPDBindingProxyConfigsFromEnv(idx int, binding *httpd.Binding) bool {
 	return isSet
 }
 
-func getHTTPDBindingFromEnv(idx int) { //nolint:gocyclo
+func getHTTPDBindingFromEnv(idx int) {
 	binding := getDefaultHTTPBinding(idx)
 	isSet := false
 
@@ -1893,6 +1899,12 @@ func getHTTPDBindingFromEnv(idx int) { //nolint:gocyclo
 	renderOpenAPI, ok := lookupBoolFromEnv(fmt.Sprintf("SFTPGO_HTTPD__BINDINGS__%v__RENDER_OPENAPI", idx))
 	if ok {
 		binding.RenderOpenAPI = renderOpenAPI
+		isSet = true
+	}
+
+	baseURL, ok := os.LookupEnv(fmt.Sprintf("SFTPGO_HTTPD__BINDINGS__%d__BASE_URL", idx))
+	if ok {
+		binding.BaseURL = baseURL
 		isSet = true
 	}
 
@@ -2057,8 +2069,9 @@ func setViperDefaults() {
 	viper.SetDefault("common.actions.hook", globalConf.Common.Actions.Hook)
 	viper.SetDefault("common.setstat_mode", globalConf.Common.SetstatMode)
 	viper.SetDefault("common.rename_mode", globalConf.Common.RenameMode)
+	viper.SetDefault("common.symlink_mode", globalConf.Common.SymlinkMode)
 	viper.SetDefault("common.resume_max_size", globalConf.Common.ResumeMaxSize)
-	viper.SetDefault("common.temp_path", globalConf.Common.TempPath)
+	viper.SetDefault("common.secret_min_entropy", globalConf.Common.SecretMinEntropy)
 	viper.SetDefault("common.proxy_protocol", globalConf.Common.ProxyProtocol)
 	viper.SetDefault("common.proxy_allowed", globalConf.Common.ProxyAllowed)
 	viper.SetDefault("common.proxy_skipped", globalConf.Common.ProxySkipped)
@@ -2102,12 +2115,13 @@ func setViperDefaults() {
 	viper.SetDefault("sftpd.host_certificates", globalConf.SFTPD.HostCertificates)
 	viper.SetDefault("sftpd.host_key_algorithms", globalConf.SFTPD.HostKeyAlgorithms)
 	viper.SetDefault("sftpd.kex_algorithms", globalConf.SFTPD.KexAlgorithms)
-	viper.SetDefault("sftpd.min_dh_group_exchange_key_size", globalConf.SFTPD.MinDHGroupExchangeKeySize)
 	viper.SetDefault("sftpd.ciphers", globalConf.SFTPD.Ciphers)
 	viper.SetDefault("sftpd.macs", globalConf.SFTPD.MACs)
 	viper.SetDefault("sftpd.public_key_algorithms", globalConf.SFTPD.PublicKeyAlgorithms)
 	viper.SetDefault("sftpd.trusted_user_ca_keys", globalConf.SFTPD.TrustedUserCAKeys)
 	viper.SetDefault("sftpd.revoked_user_certs_file", globalConf.SFTPD.RevokedUserCertsFile)
+	viper.SetDefault("sftpd.opkssh_path", globalConf.SFTPD.OPKSSHPath)
+	viper.SetDefault("sftpd.opkssh_checksum", globalConf.SFTPD.OPKSSHChecksum)
 	viper.SetDefault("sftpd.login_banner_file", globalConf.SFTPD.LoginBannerFile)
 	viper.SetDefault("sftpd.enabled_ssh_commands", sftpd.GetDefaultSSHCommands())
 	viper.SetDefault("sftpd.keyboard_interactive_authentication", globalConf.SFTPD.KeyboardInteractiveAuthentication)
@@ -2150,6 +2164,7 @@ func setViperDefaults() {
 	viper.SetDefault("data_provider.port", globalConf.ProviderConf.Port)
 	viper.SetDefault("data_provider.username", globalConf.ProviderConf.Username)
 	viper.SetDefault("data_provider.password", globalConf.ProviderConf.Password)
+	viper.SetDefault("data_provider.password_file", globalConf.ProviderConf.PasswordFile)
 	viper.SetDefault("data_provider.sslmode", globalConf.ProviderConf.SSLMode)
 	viper.SetDefault("data_provider.disable_sni", globalConf.ProviderConf.DisableSNI)
 	viper.SetDefault("data_provider.target_session_attrs", globalConf.ProviderConf.TargetSessionAttrs)

@@ -1,9 +1,9 @@
 <!--
 Copyright (C) 2023 Nicola Murino
 
-This WebUI uses the KeenThemes Mega Bundle, a proprietary theme:
+This WebUI uses the KeenThemes Bootstrap Templates:
 
-https://keenthemes.com/products/templates-mega-bundle
+https://keenthemes.com/bootstrap-templates
 
 KeenThemes HTML/CSS/JS components are allowed for use only within the
 SFTPGo product and restricted to be used in a resealable HTML template
@@ -76,9 +76,17 @@ explicit grant from the SFTPGo Team (support@sftpgo.com).
         return div.innerHTML;
     }
 
-    function fileSizeIEC(a,b,c,d,e){
-        return (b=Math,c=b.log,d=1024,e=c(a)/c(d)|0,a/b.pow(d,e)).toFixed(1)
-            +' '+(e?'KMGTPEZY'[--e]+'iB':'Bytes')
+    function fileSizeIEC(bytes){
+        const thresh = 1024;
+        if (bytes < thresh){
+            return bytes + ' Bytes';
+        }
+
+        const units = ['KiB', 'MiB', 'GiB', 'TiB', 'PiB', 'EiB', 'ZiB', 'YiB'];
+        let i = Math.floor(Math.log(bytes) / Math.log(thresh));
+        let size = bytes / Math.pow(thresh, i);
+
+        return size.toFixed(1) + ' ' + units[i - 1];
     }
 
     function humanizeSpeed(a,b,c,d,e){
@@ -182,6 +190,10 @@ explicit grant from the SFTPGo Team (support@sftpgo.com).
     lngs.de = { nativeName: 'Deutsch' };
     //{{- else if eq . "fr" }}
     lngs.fr = { nativeName: 'Français' };
+    //{{- else if eq . "es" }}
+    lngs.es = { nativeName: 'Español' };
+    //{{- else if eq . "zh-CN" }}
+    lngs["zh-CN"] = { nativeName: '简体中文' };
     //{{- end}}
     //{{- end}}
     if (Object.keys(lngs).length == 0){
@@ -206,7 +218,6 @@ explicit grant from the SFTPGo Team (support@sftpgo.com).
                 debug: false,
                 supportedLngs: Object.keys(lngs),
                 fallbackLng: Object.keys(lngs)[0],
-                load: 'languageOnly',
                 backend: {
                     backends: [
                         i18nextLocalStorageBackend,
@@ -263,8 +274,25 @@ explicit grant from the SFTPGo Team (support@sftpgo.com).
 
     function setI18NData(el, value, options) {
         el.removeAttr("data-i18n-options");
+        el.removeData("i18n-options");
         el.attr("data-i18n", value);
         el.localize(options);
+    }
+
+    function flatpickrLocale() {
+        const currentLang = i18next.resolvedLanguage;
+        if (currentLang === 'zh-CN') {
+            return 'zh';
+        }
+        return currentLang;
+    }
+
+    function humanizeDurationLocale() {
+        const currentLang = i18next.resolvedLanguage;
+        if (currentLang === 'zh-CN') {
+            return 'zh_CN';
+        }
+        return currentLang;
     }
 
     function handlePasswordInputVisibility(el) {
@@ -797,6 +825,21 @@ explicit grant from the SFTPGo Team (support@sftpgo.com).
         </div>
     </div>
 </div>
+{{- end}}
+
+{{- define "warnmsg"}}
+{{- if .}}
+<div class="rounded border-warning border border-dashed bg-light-warning d-flex align-items-center p-5 mb-10">
+    <i class="ki-duotone ki-information-5 fs-3x text-warning me-5">
+        <span class="path1"></span>
+        <span class="path2"></span>
+        <span class="path3"></span>
+    </i>
+    <div class="text-gray-800 fw-bold fs-5 d-flex flex-column pe-0 pe-sm-10">
+        <span data-i18n="{{.Message}}" {{if .HasArgs}}data-i18n-options="{{.Args}}"{{end}}></span>
+    </div>
+</div>
+{{- end}}
 {{- end}}
 
 {{- define "infomsg"}}

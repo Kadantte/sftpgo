@@ -270,6 +270,7 @@ Ap157PUHTriSnxyMF2Sb3EhX/rQkmbnbCqqygHC14iBy8MrKzLG00X6BelZV5n0D
 RKjnkiEZeG4+G91Xu7+HmcBLwV86k5I+tXK9O1Okomr6Zry8oqVcxU5TB6VRS+rA
 ubwF00Drdvk2+kDZfxIM137nBiy7wgCJi2Ksm5ihN3dUF6Q0oNPl
 -----END RSA PRIVATE KEY-----`
+	osWindows = "windows"
 )
 
 // MockOsFs mockable OsFs
@@ -523,7 +524,7 @@ func TestResolvePathErrors(t *testing.T) {
 		assert.EqualError(t, err, common.ErrGenericFailure.Error())
 	}
 
-	if runtime.GOOS != "windows" {
+	if runtime.GOOS != osWindows {
 		user.HomeDir = filepath.Clean(os.TempDir())
 		connection.User = user
 		fs := vfs.NewOsFs("connID", connection.User.HomeDir, "", nil)
@@ -582,7 +583,9 @@ func TestFileAccessErrors(t *testing.T) {
 	p := filepath.Join(user.HomeDir, "adir", missingPath)
 	_, err = connection.handleUploadToNewFile(fs, p, p, path.Join("adir", missingPath))
 	assert.ErrorIs(t, err, os.ErrNotExist)
-	_, err = connection.handleUploadToExistingFile(fs, p, "_"+p, 0, path.Join("adir", missingPath))
+	// the atomic upload temp path lives in the same directory as the target
+	pTemp := filepath.Join(filepath.Dir(p), "_"+filepath.Base(p))
+	_, err = connection.handleUploadToExistingFile(fs, p, pTemp, 0, path.Join("adir", missingPath))
 	if assert.Error(t, err) {
 		assert.ErrorIs(t, err, os.ErrNotExist)
 	}
@@ -733,7 +736,7 @@ func TestContentType(t *testing.T) {
 	err = davFile.Close()
 	assert.NoError(t, err)
 
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		// the second time the cache will be used
 		baseTransfer = common.NewBaseTransfer(nil, connection.BaseConnection, nil, testFilePath, testFilePath, testFile+".custom",
 			common.TransferDownload, 0, 0, 0, 0, false, fs, dataprovider.TransferQuota{})
@@ -1048,7 +1051,7 @@ func TestBasicUsersCache(t *testing.T) {
 
 	ipAddr := "127.0.0.1"
 
-	_, _, _, _, err = server.authenticate(req, ipAddr) //nolint:dogsled
+	_, _, _, _, err = server.authenticate(req, ipAddr)
 	assert.Error(t, err)
 
 	now := time.Now()
@@ -1070,7 +1073,7 @@ func TestBasicUsersCache(t *testing.T) {
 	}
 	// a wrong password must fail
 	req.SetBasicAuth(username, "wrong")
-	_, _, _, _, err = server.authenticate(req, ipAddr) //nolint:dogsled
+	_, _, _, _, err = server.authenticate(req, ipAddr)
 	assert.EqualError(t, err, dataprovider.ErrInvalidCredentials.Error())
 	req.SetBasicAuth(username, password)
 
@@ -1133,6 +1136,68 @@ func TestBasicUsersCache(t *testing.T) {
 	assert.NoError(t, err)
 }
 
+func TestUsersCacheNamingRules(t *testing.T) {
+	username := "webdav_internal_naming_rules"
+	password := "pwd"
+	u := dataprovider.User{
+		BaseUser: sdk.BaseUser{
+			Username:       username,
+			Password:       password,
+			HomeDir:        filepath.Join(os.TempDir(), username),
+			Status:         1,
+			ExpirationDate: 0,
+		},
+	}
+	u.Permissions = make(map[string][]string)
+	u.Permissions["/"] = []string{dataprovider.PermAny}
+	err := dataprovider.AddUser(&u, "", "", "")
+	assert.NoError(t, err)
+
+	c := &Configuration{
+		Bindings: []Binding{
+			{
+				Port: 9000,
+			},
+		},
+		Cache: Cache{
+			Users: UsersCacheConfig{
+				MaxSize:        50,
+				ExpirationTime: 1,
+			},
+		},
+	}
+	dataprovider.InitializeWebDAVUserCache(c.Cache.Users.MaxSize)
+	server := webDavServer{
+		config:  c,
+		binding: c.Bindings[0],
+	}
+
+	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("/%v", username), nil)
+	assert.NoError(t, err)
+	// the naming rules trim the spaces, the account is stored and cached without them
+	req.SetBasicAuth(username+" ", password)
+
+	ipAddr := "127.0.0.1"
+	_, isCached, lockSystem, _, err := server.authenticate(req, ipAddr)
+	assert.NoError(t, err)
+	assert.False(t, isCached)
+	assert.NotNil(t, lockSystem)
+
+	_, isCached, cachedLockSystem, _, err := server.authenticate(req, ipAddr)
+	assert.NoError(t, err)
+	assert.True(t, isCached)
+	assert.Same(t, lockSystem, cachedLockSystem)
+
+	dataprovider.RemoveCachedWebDAVUser(username + " ")
+	_, ok := dataprovider.GetCachedWebDAVUser(username)
+	assert.False(t, ok)
+
+	err = dataprovider.DeleteUser(username, "", "", "")
+	assert.NoError(t, err)
+	err = os.RemoveAll(u.GetHomeDir())
+	assert.NoError(t, err)
+}
+
 func TestCachedUserWithFolders(t *testing.T) {
 	username := "webdav_internal_folder_test"
 	password := "dav_pwd"
@@ -1189,7 +1254,7 @@ func TestCachedUserWithFolders(t *testing.T) {
 
 	ipAddr := "127.0.0.1"
 
-	_, _, _, _, err = server.authenticate(req, ipAddr) //nolint:dogsled
+	_, _, _, _, err = server.authenticate(req, ipAddr)
 	assert.Error(t, err)
 
 	now := time.Now()
@@ -1237,22 +1302,23 @@ func TestCachedUserWithFolders(t *testing.T) {
 		assert.False(t, cachedUser.IsExpired())
 	}
 
+	// a folder referenced by a user cannot be removed
 	err = dataprovider.DeleteFolder(folderName, "", "", "")
-	assert.NoError(t, err)
-	// removing a used folder should invalidate the cache
+	if assert.Error(t, err) {
+		assert.Contains(t, err.Error(), "is referenced")
+	}
 	_, isCached, _, loginMethod, err = server.authenticate(req, ipAddr)
 	assert.NoError(t, err)
-	assert.False(t, isCached)
+	assert.True(t, isCached)
 	assert.Equal(t, dataprovider.LoginMethodPassword, loginMethod)
-	cachedUser, ok = dataprovider.GetCachedWebDAVUser(username)
-	if assert.True(t, ok) {
-		assert.False(t, cachedUser.IsExpired())
-	}
 
 	err = dataprovider.DeleteUser(user.Username, "", "", "")
 	assert.NoError(t, err)
 	_, ok = dataprovider.GetCachedWebDAVUser(username)
 	assert.False(t, ok)
+
+	err = dataprovider.DeleteFolder(folderName, "", "", "")
+	assert.NoError(t, err)
 
 	err = os.RemoveAll(u.GetHomeDir())
 	assert.NoError(t, err)
@@ -1569,7 +1635,7 @@ func TestMimeCache(t *testing.T) {
 }
 
 func TestVerifyTLSConnection(t *testing.T) {
-	oldCertMgr := certMgr
+	oldCertMgr := certMgr.Load()
 
 	caCrlPath := filepath.Join(os.TempDir(), "testcrl.crt")
 	certPath := filepath.Join(os.TempDir(), "test.crt")
@@ -1588,11 +1654,12 @@ func TestVerifyTLSConnection(t *testing.T) {
 			ID:   common.DefaultTLSKeyPaidID,
 		},
 	}
-	certMgr, err = common.NewCertManager(keyPairs, "", "webdav_test")
+	mgr, err := common.NewCertManager(keyPairs, "", "webdav_test")
 	assert.NoError(t, err)
+	certMgr.Store(mgr)
 
-	certMgr.SetCARevocationLists([]string{caCrlPath})
-	err = certMgr.LoadCRLs()
+	certMgr.Load().SetCARevocationLists([]string{caCrlPath})
+	err = certMgr.Load().LoadCRLs()
 	assert.NoError(t, err)
 
 	crt, err := tls.X509KeyPair([]byte(client1Crt), []byte(client1Key))
@@ -1635,19 +1702,19 @@ func TestVerifyTLSConnection(t *testing.T) {
 	err = os.Remove(keyPath)
 	assert.NoError(t, err)
 
-	certMgr = oldCertMgr
+	certMgr.Store(oldCertMgr)
 }
 
 func TestMisc(t *testing.T) {
-	oldCertMgr := certMgr
+	oldCertMgr := certMgr.Load()
 
-	certMgr = nil
+	certMgr.Store(nil)
 	err := ReloadCertificateMgr()
 	assert.Nil(t, err)
 	val := getConfigPath("", ".")
 	assert.Empty(t, val)
 
-	certMgr = oldCertMgr
+	certMgr.Store(oldCertMgr)
 }
 
 func TestParseTime(t *testing.T) {
@@ -1739,4 +1806,69 @@ func TestGetCacheExpirationTime(t *testing.T) {
 	assert.True(t, c.getExpirationTime().IsZero())
 	c.ExpirationTime = 1
 	assert.False(t, c.getExpirationTime().IsZero())
+}
+
+func TestBindingGetAddress(t *testing.T) {
+	tests := []struct {
+		name    string
+		binding Binding
+		want    string
+	}{
+		{
+			name:    "IP address with port",
+			binding: Binding{Address: "127.0.0.1", Port: 8080},
+			want:    "127.0.0.1:8080",
+		},
+		{
+			name:    "Unix socket path (no port)",
+			binding: Binding{Address: "/tmp/app.sock", Port: 0},
+			want:    "/tmp/app.sock",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.binding.GetAddress(); got != tt.want {
+				t.Errorf("GetAddress() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestBindingIsValid(t *testing.T) {
+	tests := []struct {
+		name    string
+		binding Binding
+		want    bool
+	}{
+		{
+			name:    "Valid: Positive port",
+			binding: Binding{Address: "127.0.0.1", Port: 10080},
+			want:    true,
+		},
+		{
+			name:    "Valid: Absolute path on Unix (non-Windows)",
+			binding: Binding{Address: "/var/run/app.sock", Port: 0},
+			// This test outcome is dynamic based on the OS
+			want: runtime.GOOS != osWindows,
+		},
+		{
+			name:    "Invalid: Port 0 and relative path",
+			binding: Binding{Address: "relative/path", Port: 0},
+			want:    false,
+		},
+		{
+			name:    "Invalid: Empty address and port 0",
+			binding: Binding{Address: "", Port: 0},
+			want:    false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.binding.IsValid(); got != tt.want {
+				t.Errorf("IsValid() = %v, want %v", got, tt.want)
+			}
+		})
+	}
 }

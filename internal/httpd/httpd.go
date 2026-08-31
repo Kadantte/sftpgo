@@ -23,12 +23,14 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -83,7 +85,6 @@ const (
 	user2FARecoveryCodesPath              = "/api/v2/user/2fa/recoverycodes"
 	userProfilePath                       = "/api/v2/user/profile"
 	userSharesPath                        = "/api/v2/user/shares"
-	retentionBasePath                     = "/api/v2/retention/users"
 	retentionChecksPath                   = "/api/v2/retention/users/checks"
 	fsEventsPath                          = "/api/v2/events/fs"
 	providerEventsPath                    = "/api/v2/events/provider"
@@ -191,8 +192,9 @@ const (
 )
 
 var (
-	certMgr                        *common.CertManager
+	certMgr                        atomic.Pointer[common.CertManager]
 	cleanupTicker                  *time.Ticker
+	globalSettingsOnce             sync.Once
 	cleanupDone                    chan bool
 	invalidatedJWTTokens           tokenManager
 	webRootPath                    string
@@ -628,6 +630,10 @@ type Binding struct {
 	HideLoginURL int `json:"hide_login_url" mapstructure:"hide_login_url"`
 	// Enable the built-in OpenAPI renderer
 	RenderOpenAPI bool `json:"render_openapi" mapstructure:"render_openapi"`
+	// BaseURL defines the external base URL for generating public links
+	// (currently share access link), bypassing the default browser-based
+	// detection.
+	BaseURL string `json:"base_url" mapstructure:"base_url"`
 	// Languages defines the list of enabled translations for the WebAdmin and WebClient UI.
 	Languages []string `json:"languages" mapstructure:"languages"`
 	// Defining an OIDC configuration the web admin and web client UI will use OpenID to authenticate users.
@@ -668,6 +674,24 @@ func (b *Binding) languages() []string {
 	return b.Languages
 }
 
+func (b *Binding) validateBaseURL() error {
+	if b.BaseURL == "" {
+		return nil
+	}
+	u, err := url.ParseRequestURI(b.BaseURL)
+	if err != nil {
+		return err
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("invalid base URL schema %s", b.BaseURL)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("invalid base URL host %s", b.BaseURL)
+	}
+	b.BaseURL = strings.TrimRight(u.String(), "/")
+	return nil
+}
+
 func (b *Binding) parseAllowedProxy() error {
 	if filepath.IsAbs(b.Address) && len(b.ProxyAllowed) > 0 {
 		// unix domain socket
@@ -699,6 +723,18 @@ func (b *Binding) IsValid() bool {
 		return true
 	}
 	return false
+}
+
+func (b *Binding) check() error {
+	if err := b.parseAllowedProxy(); err != nil {
+		return err
+	}
+	if err := b.validateBaseURL(); err != nil {
+		return err
+	}
+	b.checkBranding()
+	b.Security.updateProxyHeaders()
+	return nil
 }
 
 func (b *Binding) isWebAdminOIDCLoginDisabled() bool {
@@ -1117,18 +1153,18 @@ func (c *Conf) Initialize(configDir string, isShared int) error {
 		if err := mgr.LoadCRLs(); err != nil {
 			return err
 		}
-		certMgr = mgr
+		certMgr.Store(mgr)
 	}
 
-	if c.SigningPassphraseFile != "" {
-		passphrase, err := util.ReadConfigFromFile(c.SigningPassphraseFile, configDir)
-		if err != nil {
-			return err
-		}
-		c.SigningPassphrase = passphrase
+	passphrase, err := util.ResolveConfigValue(c.SigningPassphrase, c.SigningPassphraseFile, configDir)
+	if err != nil {
+		return err
 	}
+	c.SigningPassphrase = passphrase
 
 	hideSupportLink = c.HideSupportLink
+
+	c.applyGlobalSettings()
 
 	exitChannel := make(chan error, 1)
 
@@ -1136,11 +1172,9 @@ func (c *Conf) Initialize(configDir string, isShared int) error {
 		if !binding.IsValid() {
 			continue
 		}
-		if err := binding.parseAllowedProxy(); err != nil {
+		if err := binding.check(); err != nil {
 			return err
 		}
-		binding.checkBranding()
-		binding.Security.updateProxyHeaders()
 
 		go func(b Binding) {
 			if err := b.OIDC.initialize(); err != nil {
@@ -1158,13 +1192,18 @@ func (c *Conf) Initialize(configDir string, isShared int) error {
 		}(binding)
 	}
 
-	maxUploadFileSize = c.MaxUploadFileSize
-	installationCode = c.Setup.InstallationCode
-	installationCodeHint = c.Setup.InstallationCodeHint
-	updateTokensDuration(c.JWTLifetime, c.CookieLifetime, c.ShareCookieLifetime)
-	startCleanupTicker(10 * time.Minute)
-	c.setTokenValidationMode()
 	return <-exitChannel
+}
+
+func (c *Conf) applyGlobalSettings() {
+	globalSettingsOnce.Do(func() {
+		maxUploadFileSize = c.MaxUploadFileSize
+		installationCode = c.Setup.InstallationCode
+		installationCodeHint = c.Setup.InstallationCodeHint
+		updateTokensDuration(c.JWTLifetime, c.CookieLifetime, c.ShareCookieLifetime)
+		startCleanupTicker(10 * time.Minute)
+		c.setTokenValidationMode()
+	})
 }
 
 func isWebRequest(r *http.Request) bool {
@@ -1177,8 +1216,8 @@ func isWebClientRequest(r *http.Request) bool {
 
 // ReloadCertificateMgr reloads the certificate manager
 func ReloadCertificateMgr() error {
-	if certMgr != nil {
-		return certMgr.Reload()
+	if mgr := certMgr.Load(); mgr != nil {
+		return mgr.Reload()
 	}
 	return nil
 }
@@ -1221,14 +1260,15 @@ func fileServer(r chi.Router, path string, root http.FileSystem, disableDirector
 		path += "/"
 	}
 	path += "*"
+	if disableDirectoryIndex {
+		root = neuteredFileSystem{root}
+	}
+	handler := http.FileServer(root)
 
 	r.Get(path, func(w http.ResponseWriter, r *http.Request) {
 		rctx := chi.RouteContext(r.Context())
 		pathPrefix := strings.TrimSuffix(rctx.RoutePattern(), "/*")
-		if disableDirectoryIndex {
-			root = neuteredFileSystem{root}
-		}
-		fs := http.StripPrefix(pathPrefix, http.FileServer(root))
+		fs := http.StripPrefix(pathPrefix, handler)
 		fs.ServeHTTP(w, r)
 	})
 }
@@ -1335,10 +1375,12 @@ func updateWebAdminURLs(baseURL string) {
 }
 
 // GetHTTPRouter returns an HTTP handler suitable to use for test cases
-func GetHTTPRouter(b Binding) http.Handler {
+func GetHTTPRouter(b Binding) (http.Handler, error) {
 	server := newHttpdServer(b, filepath.Join("..", "..", "static"), "", CorsConfig{}, filepath.Join("..", "..", "openapi"))
-	server.initializeRouter()
-	return server.router
+	if err := server.initializeRouter(); err != nil {
+		return nil, err
+	}
+	return server.router, nil
 }
 
 // the ticker cannot be started/stopped from multiple goroutines
@@ -1410,16 +1452,19 @@ func (nfs neuteredFileSystem) Open(name string) (http.File, error) {
 
 	s, err := f.Stat()
 	if err != nil {
+		f.Close()
+
 		return nil, err
 	}
 
 	if s.IsDir() {
-		index := path.Join(name, "index.html")
-		if _, err := nfs.fs.Open(index); err != nil {
-			defer f.Close()
+		index, err := nfs.fs.Open(path.Join(name, "index.html"))
+		if err != nil {
+			f.Close()
 
 			return nil, err
 		}
+		index.Close()
 	}
 
 	return f, nil

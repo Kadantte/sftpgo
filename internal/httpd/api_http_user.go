@@ -31,12 +31,13 @@ import (
 
 	"github.com/drakkan/sftpgo/v2/internal/common"
 	"github.com/drakkan/sftpgo/v2/internal/dataprovider"
+	"github.com/drakkan/sftpgo/v2/internal/jwt"
 	"github.com/drakkan/sftpgo/v2/internal/logger"
 	"github.com/drakkan/sftpgo/v2/internal/util"
 )
 
 func getUserConnection(w http.ResponseWriter, r *http.Request) (*Connection, error) {
-	claims, err := getTokenClaims(r)
+	claims, err := jwt.FromContext(r.Context())
 	if err != nil || claims.Username == "" {
 		sendAPIResponse(w, r, err, "Invalid token claims", http.StatusBadRequest)
 		return nil, fmt.Errorf("invalid token claims %w", err)
@@ -53,11 +54,8 @@ func getUserConnection(w http.ResponseWriter, r *http.Request) (*Connection, err
 		sendAPIResponse(w, r, err, http.StatusText(http.StatusForbidden), http.StatusForbidden)
 		return nil, err
 	}
-	connection := &Connection{
-		BaseConnection: common.NewBaseConnection(connID, protocol, util.GetHTTPLocalAddress(r),
-			r.RemoteAddr, user),
-		request: r,
-	}
+	baseConn := common.NewBaseConnection(connID, protocol, util.GetHTTPLocalAddress(r), r.RemoteAddr, user)
+	connection := newConnection(baseConn, w, r)
 	if err = common.Connections.Add(connection); err != nil {
 		sendAPIResponse(w, r, err, "Unable to add connection", http.StatusTooManyRequests)
 		return connection, err
@@ -90,7 +88,7 @@ func createUserDir(w http.ResponseWriter, r *http.Request) {
 	}
 	defer common.Connections.Remove(connection.GetID())
 
-	connection.User.CheckFsRoot(connection.ID) //nolint:errcheck
+	_ = connection.User.CheckFsRoot(connection.ID)
 	name := connection.User.GetCleanedPath(r.URL.Query().Get("path"))
 	if getBoolQueryParam(r, "mkdir_parents") {
 		if err = connection.CheckParentDirs(path.Dir(name)); err != nil {
@@ -98,7 +96,7 @@ func createUserDir(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	err = connection.CreateDir(name, true)
+	err = connection.CreateDir(name)
 	if err != nil {
 		sendAPIResponse(w, r, err, fmt.Sprintf("Unable to create directory %q", name), getMappedStatusCode(err))
 		return
@@ -208,8 +206,7 @@ func getUserFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	inline := r.URL.Query().Get("inline") != ""
-	if status, err := downloadFile(w, r, connection, name, info, inline, nil); err != nil {
+	if status, err := downloadFile(w, r, connection, name, info, false, nil); err != nil {
 		resp := apiResponse{
 			Error:   err.Error(),
 			Message: http.StatusText(status),
@@ -273,7 +270,7 @@ func uploadUserFile(w http.ResponseWriter, r *http.Request) {
 	}
 	defer common.Connections.Remove(connection.GetID())
 
-	connection.User.CheckFsRoot(connection.ID) //nolint:errcheck
+	_ = connection.User.CheckFsRoot(connection.ID)
 	filePath := connection.User.GetCleanedPath(r.URL.Query().Get("path"))
 	if getBoolQueryParam(r, "mkdir_parents") {
 		if err = connection.CheckParentDirs(path.Dir(filePath)); err != nil {
@@ -281,7 +278,7 @@ func uploadUserFile(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	doUploadFile(w, r, connection, filePath) //nolint:errcheck
+	_ = doUploadFile(w, r, connection, filePath)
 }
 
 func doUploadFile(w http.ResponseWriter, r *http.Request, connection *Connection, filePath string) error {
@@ -292,7 +289,8 @@ func doUploadFile(w http.ResponseWriter, r *http.Request, connection *Connection
 	}
 	_, err = io.Copy(writer, r.Body)
 	if err != nil {
-		writer.Close() //nolint:errcheck
+		markTransferError(writer, err)
+		writer.Close()
 		sendAPIResponse(w, r, err, fmt.Sprintf("Error saving file %q", filePath), getMappedStatusCode(err))
 		return err
 	}
@@ -317,7 +315,7 @@ func uploadUserFiles(w http.ResponseWriter, r *http.Request) {
 	}
 	defer common.Connections.Remove(connection.GetID())
 
-	if err := common.Connections.IsNewTransferAllowed(connection.User.Username); err != nil {
+	if err := common.Connections.IsNewTransferAllowed(connection.BaseConnection); err != nil {
 		connection.Log(logger.LevelInfo, "denying file write due to number of transfer limits")
 		sendAPIResponse(w, r, err, "Denying file write due to transfer count limits",
 			http.StatusConflict)
@@ -332,16 +330,11 @@ func uploadUserFiles(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	t := newThrottledReader(r.Body, connection.User.UploadBandwidth, connection)
-	r.Body = t
-	err = r.ParseMultipartForm(maxMultipartMem)
-	if err != nil {
-		connection.RemoveTransfer(t)
+	if err = parseUploadMultipartForm(connection, r); err != nil {
 		sendAPIResponse(w, r, err, "Unable to parse multipart form", http.StatusBadRequest)
 		return
 	}
-	connection.RemoveTransfer(t)
-	defer r.MultipartForm.RemoveAll() //nolint:errcheck
+	defer r.MultipartForm.RemoveAll()
 
 	parentDir := connection.User.GetCleanedPath(r.URL.Query().Get("path"))
 	files := r.MultipartForm.File["filenames"]
@@ -349,7 +342,7 @@ func uploadUserFiles(w http.ResponseWriter, r *http.Request) {
 		sendAPIResponse(w, r, nil, "No files uploaded!", http.StatusBadRequest)
 		return
 	}
-	connection.User.CheckFsRoot(connection.ID) //nolint:errcheck
+	_ = connection.User.CheckFsRoot(connection.ID)
 	if getBoolQueryParam(r, "mkdir_parents") {
 		if err = connection.CheckParentDirs(parentDir); err != nil {
 			sendAPIResponse(w, r, err, "Error checking parent directories", getMappedStatusCode(err))
@@ -380,7 +373,8 @@ func doUploadFiles(w http.ResponseWriter, r *http.Request, connection *Connectio
 		}
 		_, err = io.Copy(writer, file)
 		if err != nil {
-			writer.Close() //nolint:errcheck
+			markTransferError(writer, err)
+			writer.Close()
 			sendAPIResponse(w, r, err, fmt.Sprintf("Error saving file %q", f.Filename), getMappedStatusCode(err))
 			return uploaded
 		}
@@ -460,7 +454,7 @@ func getUserFilesAsZipStream(w http.ResponseWriter, r *http.Request) {
 
 func getUserProfile(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestSize)
-	claims, err := getTokenClaims(r)
+	claims, err := jwt.FromContext(r.Context())
 	if err != nil || claims.Username == "" {
 		sendAPIResponse(w, r, err, "Invalid token claims", http.StatusBadRequest)
 		return
@@ -485,7 +479,7 @@ func getUserProfile(w http.ResponseWriter, r *http.Request) {
 
 func updateUserProfile(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestSize)
-	claims, err := getTokenClaims(r)
+	claims, err := jwt.FromContext(r.Context())
 	if err != nil || claims.Username == "" {
 		sendAPIResponse(w, r, err, "Invalid token claims", http.StatusBadRequest)
 		return
@@ -540,7 +534,7 @@ func changeUserPassword(w http.ResponseWriter, r *http.Request) {
 		sendAPIResponse(w, r, err, "", getRespStatus(err))
 		return
 	}
-	invalidateToken(r)
+	_ = invalidateToken(r) // best effort: the password is already changed
 	sendAPIResponse(w, r, err, "Password updated", http.StatusOK)
 }
 
@@ -560,7 +554,7 @@ func doChangeUserPassword(r *http.Request, currentPassword, newPassword, confirm
 			util.I18nErrorChangePwdNoDifferent,
 		)
 	}
-	claims, err := getTokenClaims(r)
+	claims, err := jwt.FromContext(r.Context())
 	if err != nil || claims.Username == "" {
 		return util.NewI18nError(errInvalidTokenClaims, util.I18nErrorInvalidToken)
 	}

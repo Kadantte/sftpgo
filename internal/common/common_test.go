@@ -609,7 +609,7 @@ func TestRateLimitersIntegration(t *testing.T) {
 	assert.NoError(t, err)
 	_, err = LimitRate(ProtocolSSH, source2)
 	assert.NoError(t, err)
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		_, err = LimitRate(ProtocolWebDAV, source3)
 		assert.NoError(t, err)
 	}
@@ -652,16 +652,17 @@ func TestMaxConnections(t *testing.T) {
 	Config.MaxPerHostConnections = 0
 
 	ipAddr := "192.168.7.8"
+	tConn := NewBaseConnection("id", ProtocolSFTP, "", ipAddr, dataprovider.User{})
 	assert.NoError(t, Connections.IsNewConnectionAllowed(ipAddr, ProtocolFTP))
-	assert.NoError(t, Connections.IsNewTransferAllowed(userTestUsername))
+	assert.NoError(t, Connections.IsNewTransferAllowed(tConn))
 
 	Config.MaxTotalConnections = 1
 	Config.MaxPerHostConnections = perHost
 
 	assert.NoError(t, Connections.IsNewConnectionAllowed(ipAddr, ProtocolHTTP))
-	assert.NoError(t, Connections.IsNewTransferAllowed(userTestUsername))
+	assert.NoError(t, Connections.IsNewTransferAllowed(tConn))
 	isShuttingDown.Store(true)
-	assert.ErrorIs(t, Connections.IsNewTransferAllowed(userTestUsername), ErrShuttingDown)
+	assert.ErrorIs(t, Connections.IsNewTransferAllowed(tConn), ErrShuttingDown)
 	isShuttingDown.Store(false)
 
 	c := NewBaseConnection("id", ProtocolSFTP, "", "", dataprovider.User{})
@@ -673,7 +674,7 @@ func TestMaxConnections(t *testing.T) {
 	assert.Len(t, Connections.GetStats(""), 1)
 	assert.Error(t, Connections.IsNewConnectionAllowed(ipAddr, ProtocolSSH))
 	Connections.transfers.add(userTestUsername)
-	assert.Error(t, Connections.IsNewTransferAllowed(userTestUsername))
+	assert.Error(t, Connections.IsNewTransferAllowed(tConn))
 	Connections.transfers.remove(userTestUsername)
 	assert.Equal(t, int32(0), Connections.GetTotalTransfers())
 
@@ -693,6 +694,100 @@ func TestMaxConnections(t *testing.T) {
 	Connections.RemoveClientConnection(ipAddr)
 
 	Config.MaxTotalConnections = oldValue
+}
+
+func TestIsNewTransferAllowedPerHost(t *testing.T) {
+	oldMaxTotal := Config.MaxTotalConnections
+	oldMaxPerHost := Config.MaxPerHostConnections
+	t.Cleanup(func() {
+		Config.MaxTotalConnections = oldMaxTotal
+		Config.MaxPerHostConnections = oldMaxPerHost
+		isShuttingDown.Store(false)
+	})
+
+	newConn := func(connID, username, ipAddr string, maxSessions int) *BaseConnection {
+		return NewBaseConnection(connID, ProtocolSFTP, "", ipAddr, dataprovider.User{
+			BaseUser: sdk.BaseUser{
+				Username:    username,
+				MaxSessions: maxSessions,
+			},
+		})
+	}
+
+	// all limits disabled: never denied, even with active transfers tracked
+	Config.MaxTotalConnections = 0
+	Config.MaxPerHostConnections = 0
+	Connections.transfers.add("u-disabled")
+	Connections.transfersPerIP.add("10.0.0.1")
+	assert.NoError(t, Connections.IsNewTransferAllowed(newConn("c0", "u-disabled", "10.0.0.1", 0)))
+	Connections.transfers.remove("u-disabled")
+	Connections.transfersPerIP.remove("10.0.0.1")
+
+	// per-IP cap: keyed by client IP, not username, consistent with MaxPerHostConnections
+	Config.MaxPerHostConnections = 1
+	ip1 := "192.0.2.10"
+	ip2 := "192.0.2.11"
+	Connections.transfersPerIP.add(ip1)
+	// the per-username counter being saturated must NOT affect the per-IP decision
+	Connections.transfers.add("other-user")
+	assert.Error(t, Connections.IsNewTransferAllowed(newConn("ci", "user-a", ip1, 0)))
+	assert.NoError(t, Connections.IsNewTransferAllowed(newConn("ci", "user-a", ip2, 0)))
+	assert.NoError(t, Connections.IsNewTransferAllowed(newConn("ci", "user-a", "", 0)))
+	Connections.transfers.remove("other-user")
+	Connections.transfersPerIP.remove(ip1)
+	assert.NoError(t, Connections.IsNewTransferAllowed(newConn("ci", "user-a", ip1, 0)))
+	Config.MaxPerHostConnections = 0
+
+	// per-user cap: keyed by username via User.MaxSessions, independent of the config
+	// limits. With both config limits disabled the guard must NOT short-circuit when
+	// maxSessions > 0: this closes the SFTP multiplexing hole (many concurrent
+	// transfers on a single connection).
+	Config.MaxTotalConnections = 0
+	Config.MaxPerHostConnections = 0
+	userM := "user-m"
+	Connections.transfers.add(userM)
+	Connections.transfers.add(userM)
+	// same username, two active transfers, MaxSessions=2: a new transfer is denied
+	assert.Error(t, Connections.IsNewTransferAllowed(newConn("cm", userM, "198.51.100.30", 2)))
+	// a different user on the same IP is unaffected: the cap is per-username
+	assert.NoError(t, Connections.IsNewTransferAllowed(newConn("cm", "user-n", "198.51.100.30", 2)))
+	// the same user below its own limit is allowed
+	Connections.transfers.remove(userM)
+	assert.NoError(t, Connections.IsNewTransferAllowed(newConn("cm", userM, "198.51.100.30", 2)))
+	// MaxSessions=0 disables the per-user cap even with transfers tracked
+	assert.NoError(t, Connections.IsNewTransferAllowed(newConn("cm", userM, "198.51.100.30", 0)))
+	// an empty username is never subject to the per-user cap
+	assert.NoError(t, Connections.IsNewTransferAllowed(newConn("cm", "", "198.51.100.30", 2)))
+	Connections.transfers.remove(userM)
+	assert.Equal(t, int32(0), Connections.GetTotalTransfers())
+
+	// global cap: active transfers count toward MaxTotalConnections
+	Config.MaxTotalConnections = 1
+	Connections.transfers.add("user-a")
+	assert.Error(t, Connections.IsNewTransferAllowed(newConn("cg", "user-a", "203.0.113.5", 0)))
+	Connections.transfers.remove("user-a")
+	assert.NoError(t, Connections.IsNewTransferAllowed(newConn("cg", "user-a", "203.0.113.5", 0)))
+	assert.Equal(t, int32(0), Connections.GetTotalTransfers())
+	Config.MaxTotalConnections = 0
+
+	// shutdown takes precedence
+	isShuttingDown.Store(true)
+	assert.ErrorIs(t, Connections.IsNewTransferAllowed(newConn("cs", "user-a", "198.51.100.7", 0)), ErrShuttingDown)
+	isShuttingDown.Store(false)
+
+	// Add() enforces only the session count, not active transfers
+	userC := "user-c"
+	Connections.transfers.add(userC)
+	conn1 := &fakeConnection{BaseConnection: newConn("uc1", userC, "198.51.100.20", 1)}
+	assert.NoError(t, Connections.Add(conn1))
+	conn2 := &fakeConnection{BaseConnection: newConn("uc2", userC, "198.51.100.20", 1)}
+	err := Connections.Add(conn2)
+	if assert.Error(t, err) {
+		assert.Contains(t, err.Error(), "too many open sessions")
+	}
+	Connections.Remove(conn1.GetID())
+	Connections.transfers.remove(userC)
+	assert.Equal(t, int32(0), Connections.GetTotalTransfers())
 }
 
 func TestConnectionRoles(t *testing.T) {
@@ -828,11 +923,7 @@ func TestIdleConnections(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, Connections.GetActiveSessions(username), 2)
 
-	cFTP := NewBaseConnection("id2", ProtocolFTP, "", "", dataprovider.User{
-		BaseUser: sdk.BaseUser{
-			Status: 1,
-		},
-	})
+	cFTP := NewBaseConnection("id2", ProtocolFTP, "", "", dataprovider.User{})
 	cFTP.lastActivity.Store(time.Now().UnixNano())
 	fakeConn = &fakeConnection{
 		BaseConnection: cFTP,
@@ -1352,6 +1443,12 @@ func TestCachedFs(t *testing.T) {
 	_, p, err = conn.GetFsAndResolvedPath("/")
 	assert.NoError(t, err)
 	assert.Equal(t, filepath.Clean(os.TempDir()), p)
+	// close the filesystems before removing the home dir: on Windows the
+	// open root prevents the directory from being deleted
+	err = user.CloseFs()
+	assert.NoError(t, err)
+	err = conn.CloseFS()
+	assert.NoError(t, err)
 	user = dataprovider.User{}
 	user.HomeDir = filepath.Join(os.TempDir(), "temp")
 	user.FsConfig.Provider = sdk.S3FilesystemProvider
@@ -1563,6 +1660,15 @@ func TestVfsSameResource(t *testing.T) {
 	assert.NoError(t, err)
 	res = fs.IsSameResource(other)
 	assert.False(t, res)
+	fs.AzBlobConfig.SASURL = nil
+	other.AzBlobConfig.SASURL = nil
+	fs.AzBlobConfig.Container = "c1"
+	other.AzBlobConfig.Container = "c1"
+	res = fs.IsSameResource(other)
+	assert.True(t, res)
+	other.AzBlobConfig.Container = "c2"
+	res = fs.IsSameResource(other)
+	assert.False(t, res)
 	fs = vfs.Filesystem{
 		Provider: sdk.HTTPFilesystemProvider,
 		HTTPConfig: vfs.HTTPFsConfig{
@@ -1751,7 +1857,7 @@ func TestSQLPlaceholderLimits(t *testing.T) {
 	err := dataprovider.AddFolder(&folder, "", "", "")
 	assert.NoError(t, err)
 
-	for i := 0; i < numGroups; i++ {
+	for i := range numGroups {
 		group := dataprovider.Group{
 			BaseGroup: sdk.BaseGroup{
 				Name: fmt.Sprintf("testgroup%d", i),
@@ -1794,7 +1900,7 @@ func TestSQLPlaceholderLimits(t *testing.T) {
 	users, err := dataprovider.GetUsersForQuotaCheck(map[string]bool{user.Username: true})
 	assert.NoError(t, err)
 	if assert.Len(t, users, 1) {
-		for i := 0; i < numGroups; i++ {
+		for i := range numGroups {
 			_, ok := users[0].Permissions[fmt.Sprintf("/dir%d", i)]
 			assert.True(t, ok)
 		}
@@ -1803,7 +1909,7 @@ func TestSQLPlaceholderLimits(t *testing.T) {
 	err = dataprovider.DeleteUser(user.Username, "", "", "")
 	assert.NoError(t, err)
 
-	for i := 0; i < numUsers; i++ {
+	for i := range numUsers {
 		user := dataprovider.User{
 			BaseUser: sdk.BaseUser{
 				Username: fmt.Sprintf("testusername%d", i),
@@ -1826,10 +1932,13 @@ func TestSQLPlaceholderLimits(t *testing.T) {
 
 	time.Sleep(100 * time.Millisecond)
 
-	err = dataprovider.DeleteFolder(folder.Name, "", "", "")
+	f, err := dataprovider.GetFolderByName(folder.Name)
+	assert.NoError(t, err)
+	assert.Len(t, f.Groups, numGroups)
+	err = dataprovider.UpdateFolder(&f, f.Users, f.Groups, "", "", "")
 	assert.NoError(t, err)
 
-	for i := 0; i < numUsers; i++ {
+	for i := range numUsers {
 		username := fmt.Sprintf("testusername%d", i)
 		user, err := dataprovider.UserExists(username, "")
 		assert.NoError(t, err)
@@ -1838,11 +1947,14 @@ func TestSQLPlaceholderLimits(t *testing.T) {
 		assert.NoError(t, err)
 	}
 
-	for i := 0; i < numGroups; i++ {
+	for i := range numGroups {
 		groupName := fmt.Sprintf("testgroup%d", i)
 		err = dataprovider.DeleteGroup(groupName, "", "", "")
 		assert.NoError(t, err)
 	}
+
+	err = dataprovider.DeleteFolder(folder.Name, "", "", "")
+	assert.NoError(t, err)
 }
 
 func TestALPNProtocols(t *testing.T) {
@@ -1873,7 +1985,7 @@ func TestServerVersion(t *testing.T) {
 
 func BenchmarkBcryptHashing(b *testing.B) {
 	bcryptPassword := "bcryptpassword"
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_, err := bcrypt.GenerateFromPassword([]byte(bcryptPassword), 10)
 		if err != nil {
 			panic(err)
@@ -1883,7 +1995,7 @@ func BenchmarkBcryptHashing(b *testing.B) {
 
 func BenchmarkCompareBcryptPassword(b *testing.B) {
 	bcryptPassword := "$2a$10$lPDdnDimJZ7d5/GwL6xDuOqoZVRXok6OHHhivCnanWUtcgN0Zafki"
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		err := bcrypt.CompareHashAndPassword([]byte(bcryptPassword), []byte("password"))
 		if err != nil {
 			panic(err)
@@ -1893,7 +2005,7 @@ func BenchmarkCompareBcryptPassword(b *testing.B) {
 
 func BenchmarkArgon2Hashing(b *testing.B) {
 	argonPassword := "argon2password"
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_, err := argon2id.CreateHash(argonPassword, argon2id.DefaultParams)
 		if err != nil {
 			panic(err)
@@ -1903,7 +2015,7 @@ func BenchmarkArgon2Hashing(b *testing.B) {
 
 func BenchmarkCompareArgon2Password(b *testing.B) {
 	argon2Password := "$argon2id$v=19$m=65536,t=1,p=2$aOoAOdAwvzhOgi7wUFjXlw$wn/y37dBWdKHtPXHR03nNaKHWKPXyNuVXOknaU+YZ+s"
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_, err := argon2id.ComparePasswordAndHash("password", argon2Password)
 		if err != nil {
 			panic(err)
@@ -1913,7 +2025,7 @@ func BenchmarkCompareArgon2Password(b *testing.B) {
 
 func BenchmarkAddRemoveConnections(b *testing.B) {
 	var conns []ActiveConnection
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		conns = append(conns, &fakeConnection{
 			BaseConnection: NewBaseConnection(fmt.Sprintf("id%d", i), ProtocolSFTP, "", "", dataprovider.User{
 				BaseUser: sdk.BaseUser{
@@ -1923,14 +2035,14 @@ func BenchmarkAddRemoveConnections(b *testing.B) {
 		})
 	}
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		for _, c := range conns {
 			if err := Connections.Add(c); err != nil {
 				panic(err)
 			}
 		}
 		var wg sync.WaitGroup
-		for idx := len(conns) - 1; idx >= 0; idx-- {
+		for idx := range slices.Backward(conns) {
 			wg.Add(1)
 			go func(index int) {
 				defer wg.Done()
@@ -1944,16 +2056,16 @@ func BenchmarkAddRemoveConnections(b *testing.B) {
 func BenchmarkAddRemoveSSHConnections(b *testing.B) {
 	conn1, conn2 := net.Pipe()
 	var conns []*SSHConnection
-	for i := 0; i < 2000; i++ {
+	for i := range 2000 {
 		conns = append(conns, NewSSHConnection(fmt.Sprintf("id%d", i), conn1))
 	}
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		for _, c := range conns {
 			Connections.AddSSHConnection(c)
 		}
-		for idx := len(conns) - 1; idx >= 0; idx-- {
-			Connections.RemoveSSHConnection(conns[idx].GetID())
+		for _, conn := range slices.Backward(conns) {
+			Connections.RemoveSSHConnection(conn.GetID())
 		}
 	}
 	conn1.Close()

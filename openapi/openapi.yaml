@@ -29,7 +29,7 @@ info:
     SFTPGo supports groups to simplify the administration of multiple accounts by letting you assign settings once to a group, instead of multiple times to each individual user.
     The SFTPGo WebClient allows end users to change their credentials, browse and manage their files in the browser and setup two-factor authentication which works with Authy, Google Authenticator and other compatible apps.
     From the WebClient each authorized user can also create HTTP/S links to externally share files and folders securely, by setting limits to the number of downloads/uploads, protecting the share with a password, limiting access by source IP address, setting an automatic expiration date.
-  version: v2.6.99-dev
+  version: v2.7.0
   contact:
     name: API support
     url: 'https://github.com/drakkan/sftpgo'
@@ -163,12 +163,6 @@ paths:
           name: path
           required: true
           description: Path to the file to download. It must be URL encoded, for example the path "my dir/àdir/file.txt" must be sent as "my%20dir%2F%C3%A0dir%2Ffile.txt"
-          schema:
-            type: string
-        - in: query
-          name: inline
-          required: false
-          description: 'If set, the response will not have the Content-Disposition header set to `attachment`'
           schema:
             type: string
       responses:
@@ -1568,7 +1562,7 @@ paths:
       tags:
         - folders
       summary: Delete folder
-      description: Deletes an existing folder
+      description: Deletes an existing folder. A folder referenced by users or groups cannot be deleted, remove the references first
       operationId: delete_folder
       responses:
         '200':
@@ -1760,7 +1754,7 @@ paths:
       tags:
         - groups
       summary: Delete group
-      description: Deletes an existing group
+      description: Deletes an existing group. A group referenced by users or admins cannot be deleted, remove the references first
       operationId: delete_group
       responses:
         '200':
@@ -1940,7 +1934,7 @@ paths:
       tags:
         - roles
       summary: Delete role
-      description: Deletes an existing role
+      description: Deletes an existing role. A role referenced by users or admins cannot be deleted, remove the references first
       operationId: delete_role
       responses:
         '200':
@@ -3232,7 +3226,7 @@ paths:
       tags:
         - admins
       summary: Send a password reset code by email
-      description: 'You must set up an SMTP server and the account must have a valid email address, in which case SFTPGo will send a code via email to reset the password. If the specified admin does not exist, the request will be silently ignored (a success response will be returned) to avoid disclosing existing admins'
+      description: 'You must set up an SMTP server. SFTPGo will send a code via email to reset the password if the specified admin exists and has a valid email address. Requests that do not meet these conditions are silently ignored (a success response will be returned) to avoid disclosing existing admins'
       operationId: admin_forgot_password
       responses:
         '200':
@@ -3550,7 +3544,7 @@ paths:
       tags:
         - users
       summary: Send a password reset code by email
-      description: 'You must configure an SMTP server, the account must have a valid email address and must not have the "reset-password-disabled" restriction, in which case SFTPGo will send a code via email to reset the password. If the specified user does not exist, the request will be silently ignored (a success response will be returned) to avoid disclosing existing users'
+      description: 'You must configure an SMTP server. SFTPGo will send a code via email to reset the password if the specified user exists, has a valid email address and does not have the "reset-password-disabled" restriction. Requests that do not meet these conditions are silently ignored (a success response will be returned) to avoid disclosing existing users'
       operationId: user_forgot_password
       responses:
         '200':
@@ -4487,12 +4481,6 @@ paths:
           description: Path to the file to download. It must be URL encoded, for example the path "my dir/àdir/file.txt" must be sent as "my%20dir%2F%C3%A0dir%2Ffile.txt"
           schema:
             type: string
-        - in: query
-          name: inline
-          required: false
-          description: 'If set, the response will not have the Content-Disposition header set to `attachment`'
-          schema:
-            type: string
       responses:
         '200':
           description: successful operation
@@ -4904,7 +4892,7 @@ components:
           * `manage_defender` - remove ip from the dynamic blocklist is allowed
           * `view_defender` - list the dynamic blocklist is allowed
           * `view_events` - view and search filesystem and provider events is allowed
-          * `disable_mfa` - allow to disable two-factor authentication for users and admins
+          * `disable_mfa` - allow to disable two-factor authentication for users
     FsProviders:
       type: integer
       enum:
@@ -5324,11 +5312,11 @@ components:
         upload_bandwidth:
           type: integer
           format: int32
-          description: 'Maximum upload bandwidth as KB/s, 0 means unlimited'
+          description: 'Maximum upload bandwidth in KB/s per upload, 0 means unlimited'
         download_bandwidth:
           type: integer
           format: int32
-          description: 'Maximum download bandwidth as KB/s, 0 means unlimited'
+          description: 'Maximum download bandwidth in KB/s per upload, 0 means unlimited'
     TimePeriod:
       type: object
       properties:
@@ -5385,7 +5373,7 @@ components:
         max_upload_file_size:
           type: integer
           format: int64
-          description: 'maximum allowed size, as bytes, for a single file upload. The upload will be aborted if/when the size of the file being sent exceeds this limit. 0 means unlimited. This restriction does not apply for SSH system commands such as `git` and `rsync`'
+          description: 'maximum allowed size, as bytes, for a single file upload. The upload will be aborted if/when the size of the file being sent exceeds this limit. 0 means unlimited'
         tls_username:
           type: string
           description: 'defines the TLS certificate field to use as username. For FTP clients it must match the name provided using the "USER" command. For WebDAV, if no username is provided, the CN will be used as username. For WebDAV clients it must match the implicit or provided username. Ignored if mutual TLS is disabled. Currently the only supported value is `CommonName`'
@@ -5425,7 +5413,7 @@ components:
           enum:
             - 0
             - 1
-          description: 'Set to `1` to require TLS for both data and control connection. his setting is useful if you want to allow both encrypted and plain text FTP sessions globally and then you want to require encrypted sessions on a per-user basis. It has no effect if TLS is already required for all users in the configuration file.'
+          description: 'Set to `1` to require TLS for both data and control connection. This setting is useful to allow both encrypted and plain text FTP sessions globally and require encrypted sessions on a per-user basis. The requirement is enforced after the authentication, so it holds for accounts resolved during the login as well; cleartext sessions are closed before the password is sent when the account can be resolved beforehand. It has no effect if TLS is already required for all users in the configuration file.'
         is_anonymous:
           type: boolean
           description: 'If enabled the user can login with any password or no password at all. Anonymous users are supported for FTP and WebDAV protocols and permissions will be automatically set to "list" and "download" (read only)'
@@ -5508,7 +5496,9 @@ components:
         access_secret:
           $ref: '#/components/schemas/Secret'
         sse_customer_key:
-          $ref: '#/components/schemas/Secret'
+          allOf:
+            - $ref: '#/components/schemas/Secret'
+          description: 'Customer-provided key for S3 server-side encryption (SSE-C). This is encryption key material, not a memorable password: it must be high-entropy and random, for example a base64-encoded random value. When submitted in plain text it must pass a configurable minimum-entropy check (the "common.secret_min_entropy" setting); this is a heuristic estimate used to reject weak secrets, not a measure of cryptographic strength, so always supply key material generated by a CSPRNG. Keep a safe backup: if this key is lost, objects encrypted with it cannot be decrypted, by SFTPGo or by AWS.'
         role_arn:
           type: string
           description: 'Optional IAM Role ARN to assume'
@@ -5546,7 +5536,7 @@ components:
           description: 'Set this to "true" to force the request to use path-style addressing, i.e., "http://s3.amazonaws.com/BUCKET/KEY". By default, the S3 client will use virtual hosted bucket addressing when possible ("http://BUCKET.s3.amazonaws.com/KEY")'
         key_prefix:
           type: string
-          description: 'key_prefix is similar to a chroot directory for a local filesystem. If specified the user will only see contents that starts with this prefix and so you can restrict access to a specific virtual folder. The prefix, if not empty, must not start with "/" and must end with "/". If empty the whole bucket contents will be available'
+          description: 'key_prefix is similar to a chroot directory for a local filesystem. If specified the user will only see contents that starts with this prefix and so you can restrict access to a specific virtual folder. The prefix is normalized on save: a leading "/" is removed and a trailing "/" is added; a non-empty value that resolves to the storage root is rejected. If empty the whole bucket contents will be available'
           example: folder/subfolder/
       description: S3 Compatible Object Storage configuration details
     GCSConfig:
@@ -5573,7 +5563,7 @@ components:
           description: 'The ACL to apply to uploaded objects. Leave empty to use the default ACL. For more information and available ACLs, refer to the JSON API here: https://cloud.google.com/storage/docs/access-control/lists#predefined-acl'
         key_prefix:
           type: string
-          description: 'key_prefix is similar to a chroot directory for a local filesystem. If specified the user will only see contents that starts with this prefix and so you can restrict access to a specific virtual folder. The prefix, if not empty, must not start with "/" and must end with "/". If empty the whole bucket contents will be available'
+          description: 'key_prefix is similar to a chroot directory for a local filesystem. If specified the user will only see contents that starts with this prefix and so you can restrict access to a specific virtual folder. The prefix is normalized on save: a leading "/" is removed and a trailing "/" is added; a non-empty value that resolves to the storage root is rejected. If empty the whole bucket contents will be available'
           example: folder/subfolder/
         upload_part_size:
           type: integer
@@ -5618,7 +5608,7 @@ components:
             - Cool
         key_prefix:
           type: string
-          description: 'key_prefix is similar to a chroot directory for a local filesystem. If specified the user will only see contents that starts with this prefix and so you can restrict access to a specific virtual folder. The prefix, if not empty, must not start with "/" and must end with "/". If empty the whole container contents will be available'
+          description: 'key_prefix is similar to a chroot directory for a local filesystem. If specified the user will only see contents that starts with this prefix and so you can restrict access to a specific virtual folder. The prefix is normalized on save: a leading "/" is removed and a trailing "/" is added; a non-empty value that resolves to the storage root is rejected. If empty the whole container contents will be available'
           example: folder/subfolder/
         use_emulator:
           type: boolean
@@ -5640,7 +5630,9 @@ components:
       type: object
       properties:
         passphrase:
-          $ref: '#/components/schemas/Secret'
+          allOf:
+            - $ref: '#/components/schemas/Secret'
+          description: 'Master passphrase used to derive the per-file encryption keys. This is encryption key material, not a memorable password: it must be high-entropy and random, for example a base64-encoded random value, since the confidentiality of the stored data depends on its strength. When submitted in plain text it must pass a configurable minimum-entropy check (the "common.secret_min_entropy" setting); this is a heuristic estimate used to reject weak secrets, not a measure of cryptographic strength, so always supply key material generated by a CSPRNG. Store it safely and back it up: if it is lost, the encrypted files are permanently unrecoverable.'
         read_buffer_size:
           type: integer
           minimum: 0
@@ -5780,11 +5772,15 @@ components:
             quota_size:
               type: integer
               format: int64
-              description: 'Quota as size in bytes. 0 means unlimited, -1 means included in user quota. Please note that quota is updated if files are added/removed via SFTPGo otherwise a quota scan or a manual quota update is needed'
+              description: 'Quota as size in bytes. 0 means unlimited, -1 means included in user quota. Quota applies to the whole folder, so every mapping of the same folder uses the same limits. Please note that quota is updated if files are added/removed via SFTPGo otherwise a quota scan or a manual quota update is needed'
             quota_files:
               type: integer
               format: int32
-              description: 'Quota as number of files. 0 means unlimited, , -1 means included in user quota. Please note that quota is updated if files are added/removed via SFTPGo otherwise a quota scan or a manual quota update is needed'
+              description: 'Quota as number of files. 0 means unlimited, -1 means included in user quota. Quota applies to the whole folder, so every mapping of the same folder uses the same limits. Please note that quota is updated if files are added/removed via SFTPGo otherwise a quota scan or a manual quota update is needed'
+            subpath:
+              type: string
+              maxLength: 191
+              description: 'Re-roots the mapping: the mount at `virtual_path` serves the folder starting from this sub-path. Canonical POSIX path with a leading slash. Supported for local, encrypted, S3, GCS, Azure Blob and SFTP folders. On group mappings the `%username%` and `%role%` placeholders are supported.'
           required:
             - virtual_path
       description: 'A virtual folder is a mapping between a SFTPGo virtual path and a filesystem path outside the user home directory. The specified paths must be absolute and the virtual path cannot be "/", it must be a sub directory. The parent directory for the specified virtual path must exist. SFTPGo will try to automatically create any missing parent directory for the configured virtual folders at user login.'
@@ -5853,7 +5849,7 @@ components:
         max_sessions:
           type: integer
           format: int32
-          description: Limit the sessions that a user can open. 0 means unlimited
+          description: Maximum number of concurrent sessions and file transfers for the user. Under bursts of near-simultaneous connections, the count can briefly exceed the configured limit. 0 means unlimited
         quota_size:
           type: integer
           format: int64
@@ -5889,10 +5885,10 @@ components:
           description: Last quota update as unix timestamp in milliseconds
         upload_bandwidth:
           type: integer
-          description: 'Maximum upload bandwidth as KB/s, 0 means unlimited'
+          description: 'Maximum upload bandwidth in KB/s per upload, 0 means unlimited'
         download_bandwidth:
           type: integer
-          description: 'Maximum download bandwidth as KB/s, 0 means unlimited'
+          description: 'Maximum download bandwidth in KB/s per upload, 0 means unlimited'
         upload_data_transfer:
           type: integer
           description: 'Maximum data transfer allowed for uploads as MB. 0 means no limit'
@@ -6570,6 +6566,7 @@ components:
         max_sessions:
           type: integer
           format: int32
+          description: Maximum number of concurrent sessions and file transfers for the user. Under bursts of near-simultaneous connections, the count can briefly exceed the configured limit. 0 means unlimited
         quota_size:
           type: integer
           format: int64
@@ -6593,10 +6590,10 @@ components:
               - download
         upload_bandwidth:
           type: integer
-          description: 'Maximum upload bandwidth as KB/s'
+          description: 'Maximum upload bandwidth in KB/s per upload, 0 means unlimited'
         download_bandwidth:
           type: integer
-          description: 'Maximum download bandwidth as KB/s'
+          description: 'Maximum download bandwidth in KB/s per upload, 0 means unlimited'
         upload_data_transfer:
           type: integer
           description: 'Maximum data transfer allowed for uploads as MB'

@@ -22,9 +22,11 @@ import (
 	"net"
 	"os"
 	"path"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rs/xid"
@@ -93,6 +95,7 @@ const (
 
 var (
 	errNoMatchingVirtualFolder = errors.New("no matching virtual folder found")
+	errUnusableVirtualFolder   = errors.New("virtual folder mount cannot be served")
 	permsRenameAny             = []string{PermRename, PermRenameDirs, PermRenameFiles}
 	permsDeleteAny             = []string{PermDelete, PermDeleteDirs, PermDeleteFiles}
 )
@@ -127,7 +130,7 @@ type UserFilters struct {
 	// AdditionalEmails defines additional email addresses
 	AdditionalEmails []string `json:"additional_emails,omitempty"`
 	// Time-based one time passwords configuration
-	TOTPConfig UserTOTPConfig `json:"totp_config,omitempty"`
+	TOTPConfig UserTOTPConfig `json:"totp_config"`
 	// Recovery codes to use if the user loses access to their second factor auth device.
 	// Each code can only be used once, you should use these codes to login and disable or
 	// reset 2FA for your account
@@ -145,12 +148,27 @@ type User struct {
 	FsConfig vfs.Filesystem `json:"filesystem"`
 	// groups associated with this user
 	Groups []sdk.GroupMapping `json:"groups,omitempty"`
-	// we store the filesystem here using the base path as key.
-	fsCache map[string]vfs.Fs `json:"-"`
+	// per-connection filesystem cache, see fsCache. Never share it between
+	// concurrently running connections: it is owned and closed by a single one.
+	fsCache *fsCache `json:"-"`
 	// true if group settings are already applied for this user
 	groupSettingsApplied bool `json:"-"`
 	// in multi node setups we mark the user as deleted to be able to update the webdav cache
 	DeletedAt int64 `json:"-"`
+}
+
+// fsCache holds the per-virtual-path Fs instances used by a connection. In SFTP
+// handling we copy a single User into several concurrent connections: each
+// channel calls ResetFsCache to get its own cache.
+type fsCache struct {
+	sync.Mutex
+	entries map[string]vfs.Fs
+}
+
+// ResetFsCache gives the user a new, empty and independent filesystem cache,
+// detaching it from any cache shared with the User it was value-copied from.
+func (u *User) ResetFsCache() {
+	u.fsCache = &fsCache{entries: make(map[string]vfs.Fs)}
 }
 
 // GetFilesystem returns the base filesystem for this user
@@ -184,8 +202,7 @@ func (u *User) getRootFs(connectionID string) (fs vfs.Fs, err error) {
 
 func (u *User) checkDirWithParents(virtualDirPath, connectionID string) error {
 	dirs := util.GetDirsForVirtualPath(virtualDirPath)
-	for idx := len(dirs) - 1; idx >= 0; idx-- {
-		vPath := dirs[idx]
+	for _, vPath := range slices.Backward(dirs) {
 		if vPath == "/" {
 			continue
 		}
@@ -224,6 +241,7 @@ func (u *User) checkLocalHomeDir(connectionID string) {
 		return
 	default:
 		osFs := vfs.NewOsFs(connectionID, u.GetHomeDir(), "", nil)
+		defer osFs.Close()
 		osFs.CheckRootPath(u.Username, u.GetUID(), u.GetGID())
 	}
 }
@@ -275,6 +293,9 @@ func (u *User) CheckFsRoot(connectionID string) error {
 		fs, err := u.GetFilesystemForPath(v.VirtualPath, connectionID)
 		if err == nil {
 			fs.CheckRootPath(u.Username, u.GetUID(), u.GetGID())
+		} else {
+			logger.Warn(logSender, connectionID, "user %q: cannot create filesystem for virtual folder %q: %v",
+				u.Username, v.VirtualPath, err)
 		}
 		// now check intermediary folders
 		err = u.checkDirWithParents(path.Dir(v.VirtualPath), connectionID)
@@ -490,16 +511,19 @@ func (u *User) hasRedactedSecret() bool {
 
 // CloseFs closes the underlying filesystems
 func (u *User) CloseFs() error {
-	if u.fsCache == nil {
+	cache := u.fsCache
+	if cache == nil {
 		return nil
 	}
+	cache.Lock()
+	defer cache.Unlock()
 
 	var err error
-	for _, fs := range u.fsCache {
-		errClose := fs.Close()
-		if err == nil {
+	for key, fs := range cache.entries {
+		if errClose := fs.Close(); errClose != nil && err == nil {
 			err = errClose
 		}
+		delete(cache.entries, key)
 	}
 	return err
 }
@@ -524,10 +548,12 @@ func (u *User) IsTLSVerificationEnabled() bool {
 func (u *User) SetEmptySecrets() {
 	u.FsConfig.SetEmptySecrets()
 	for idx := range u.VirtualFolders {
-		folder := &u.VirtualFolders[idx]
-		folder.FsConfig.SetEmptySecrets()
+		u.VirtualFolders[idx].FsConfig.SetEmptySecrets()
 	}
 	u.Filters.TOTPConfig.Secret = kms.NewEmptySecret()
+	for idx := range u.Filters.RecoveryCodes {
+		u.Filters.RecoveryCodes[idx].Secret = kms.NewEmptySecret()
+	}
 }
 
 // GetPermissionsForPath returns the permissions for the given path.
@@ -605,41 +631,67 @@ func (u *User) GetFsConfigForPath(virtualPath string) vfs.Filesystem {
 
 // GetFilesystemForPath returns the filesystem for the given path
 func (u *User) GetFilesystemForPath(virtualPath, connectionID string) (vfs.Fs, error) {
+	// Lazily create the cache for callers that did not call ResetFsCache: those
+	// accesses are from a single goroutine so creating it here cannot race.
 	if u.fsCache == nil {
-		u.fsCache = make(map[string]vfs.Fs)
+		u.ResetFsCache()
 	}
-	// allow to override the `/` path with a virtual folder
+	cache := u.fsCache
+
+	// resolve the virtual folder and the cache key without touching the cache
+	var folder vfs.VirtualFolder
+	hasFolder := false
 	if len(u.VirtualFolders) > 0 {
-		folder, err := u.GetVirtualFolderForPath(virtualPath)
-		if err == nil {
-			if fs, ok := u.fsCache[folder.VirtualPath]; ok {
-				return fs, nil
-			}
-			forbiddenSelfUsers := []string{u.Username}
-			if folder.FsConfig.Provider == sdk.SFTPFilesystemProvider {
-				forbiddens, err := u.getForbiddenSFTPSelfUsers(folder.FsConfig.SFTPConfig.Username)
-				if err != nil {
-					return nil, err
-				}
-				forbiddenSelfUsers = append(forbiddenSelfUsers, forbiddens...)
-			}
-			fs, err := folder.GetFilesystem(connectionID, forbiddenSelfUsers)
-			if err == nil {
-				u.fsCache[folder.VirtualPath] = fs
-			}
-			return fs, err
+		f, err := u.GetVirtualFolderForPath(virtualPath)
+		switch {
+		case err == nil:
+			folder = f
+			hasFolder = true
+		case !errors.Is(err, errNoMatchingVirtualFolder):
+			// the path belongs to a mount that cannot be served: it must
+			// not fall through to the root filesystem
+			return nil, err
 		}
 	}
-
-	if val, ok := u.fsCache["/"]; ok {
-		return val, nil
+	cacheKey := "/"
+	if hasFolder {
+		cacheKey = folder.VirtualPath
 	}
-	fs, err := u.getRootFs(connectionID)
+
+	cache.Lock()
+	fs, ok := cache.entries[cacheKey]
+	cache.Unlock()
+	if ok {
+		return fs, nil
+	}
+
+	var err error
+	if hasFolder {
+		forbiddenSelfUsers := []string{u.Username}
+		if folder.FsConfig.Provider == sdk.SFTPFilesystemProvider {
+			forbiddens, errSelf := u.getForbiddenSFTPSelfUsers(folder.FsConfig.SFTPConfig.Username)
+			if errSelf != nil {
+				return nil, errSelf
+			}
+			forbiddenSelfUsers = append(forbiddenSelfUsers, forbiddens...)
+		}
+		fs, err = folder.GetFilesystem(connectionID, forbiddenSelfUsers)
+	} else {
+		fs, err = u.getRootFs(connectionID)
+	}
 	if err != nil {
 		return fs, err
 	}
-	u.fsCache["/"] = fs
-	return fs, err
+
+	cache.Lock()
+	defer cache.Unlock()
+
+	if existing, ok := cache.entries[cacheKey]; ok {
+		fs.Close()
+		return existing, nil
+	}
+	cache.entries[cacheKey] = fs
+	return fs, nil
 }
 
 // GetVirtualFolderForPath returns the virtual folder containing the specified virtual path.
@@ -654,11 +706,37 @@ func (u *User) GetVirtualFolderForPath(virtualPath string) (vfs.VirtualFolder, e
 		for idx := range u.VirtualFolders {
 			v := &u.VirtualFolders[idx]
 			if v.VirtualPath == dirsForPath[index] {
+				if v.Subpath != "" {
+					if !isCanonicalSubPath(v.Subpath) || v.FsConfig.Provider == sdk.HTTPFilesystemProvider {
+						return folder, fmt.Errorf("%w: mount %q, subpath %q", errUnusableVirtualFolder,
+							v.VirtualPath, v.Subpath)
+					}
+					return v.WithSubPath(v.Subpath, v.VirtualPath), nil
+				}
 				return *v, nil
 			}
 		}
 	}
 	return folder, errNoMatchingVirtualFolder
+}
+
+func isCanonicalSubPath(s string) bool {
+	if len(s) < 2 || s[0] != '/' {
+		return false
+	}
+	start := 1
+	for i := 1; i <= len(s); i++ {
+		if i == len(s) || s[i] == '/' {
+			seg := s[start:i]
+			if seg == "" || seg == "." || seg == ".." {
+				return false
+			}
+			start = i + 1
+		} else if s[i] == '\\' {
+			return false
+		}
+	}
+	return true
 }
 
 // ScanQuota scans the user home dir and virtual folders, included in its quota,
@@ -674,11 +752,14 @@ func (u *User) ScanQuota() (int, int64, error) {
 	if err != nil {
 		return numFiles, size, err
 	}
+	// quota is folder-wide.
+	scannedFolders := make(map[string]bool)
 	for idx := range u.VirtualFolders {
 		v := &u.VirtualFolders[idx]
-		if !v.IsIncludedInUserQuota() {
+		if !v.IsIncludedInUserQuota() || scannedFolders[v.Name] {
 			continue
 		}
+		scannedFolders[v.Name] = true
 		num, s, err := v.ScanQuota()
 		if err != nil {
 			return numFiles, size, err
@@ -803,6 +884,13 @@ func (u *User) IsMappedPath(fsPath string) bool {
 		if fsPath == v.MappedPath {
 			return true
 		}
+		// for local and CryptFs mappings the subpath backing directory is
+		// the mount root
+		if v.Subpath != "" && v.IsLocalOrLocalCrypted() {
+			if fsPath == filepath.Join(v.MappedPath, v.Subpath) {
+				return true
+			}
+		}
 	}
 	return false
 }
@@ -835,22 +923,36 @@ func (u *User) HasVirtualFoldersInside(virtualPath string) bool {
 	return false
 }
 
-// HasPermissionsInside returns true if the specified virtualPath has no permissions itself and
-// no subdirs with defined permissions
-func (u *User) HasPermissionsInside(virtualPath string) bool {
+// HasRenameRestrictionsInside returns true if permissions that do not allow
+// renaming both files and directories are defined for the specified virtualPath
+func (u *User) HasRenameRestrictionsInside(virtualPath string) bool {
 	for dir, perms := range u.Permissions {
-		if len(perms) == 1 && perms[0] == PermAny {
+		if permsAllowRenameAll(perms) {
 			continue
 		}
-		if dir == virtualPath {
+		if isPermissionPathInside(dir, virtualPath) {
 			return true
-		} else if len(dir) > len(virtualPath) {
-			if strings.HasPrefix(dir, virtualPath+"/") {
-				return true
-			}
 		}
 	}
 	return false
+}
+
+func isPermissionPathInside(key, virtualPath string) bool {
+	if virtualPath == "/" {
+		return true
+	}
+	prefix := virtualPath + "/"
+	if strings.ContainsAny(key, `[\`) {
+		literal := key[:strings.IndexAny(key, `*?[\`)]
+		return strings.HasPrefix(prefix, literal) || strings.HasPrefix(literal, prefix)
+	}
+	keyDirs := util.GetDirsForVirtualPath(key)
+	dirs := util.GetDirsForVirtualPath(virtualPath)
+	if len(keyDirs) < len(dirs) {
+		return false
+	}
+	match, err := path.Match(keyDirs[len(keyDirs)-len(dirs)], virtualPath)
+	return err == nil && match
 }
 
 // HasPerm returns true if the user has the given permission or any permission
@@ -913,7 +1015,10 @@ func (u *User) HasPermsDeleteAll(path string) bool {
 // HasPermsRenameAll returns true if the user can rename both files and directories
 // for the given path
 func (u *User) HasPermsRenameAll(path string) bool {
-	perms := u.GetPermissionsForPath(path)
+	return permsAllowRenameAll(u.GetPermissionsForPath(path))
+}
+
+func permsAllowRenameAll(perms []string) bool {
 	canRenameFiles := false
 	canRenameDirs := false
 	for _, permission := range perms {
@@ -1030,6 +1135,27 @@ func (u *User) getPatternsFilterForPath(virtualPath string) sdk.PatternsFilter {
 	return filter
 }
 
+// FilePatternsScopeChanges returns true if moving virtualSourcePath to
+// virtualTargetPath would change which file pattern filters govern the moved
+// contents.
+func (u *User) FilePatternsScopeChanges(virtualSourcePath, virtualTargetPath string) bool {
+	if len(u.Filters.FilePatterns) == 0 {
+		return false
+	}
+	for idx := range u.Filters.FilePatterns {
+		p := u.Filters.FilePatterns[idx].Path
+		// a filter defined on the moved tree stays behind, one defined on the
+		// target tree starts to apply
+		if p == virtualSourcePath || strings.HasPrefix(p, virtualSourcePath+"/") ||
+			p == virtualTargetPath || strings.HasPrefix(p, virtualTargetPath+"/") {
+			return true
+		}
+	}
+	// the inherited filter must be the same on both sides
+	return u.getPatternsFilterForPath(virtualSourcePath).Path !=
+		u.getPatternsFilterForPath(virtualTargetPath).Path
+}
+
 func (u *User) isDirHidden(virtualPath string) bool {
 	if len(u.Filters.FilePatterns) == 0 {
 		return false
@@ -1038,8 +1164,11 @@ func (u *User) isDirHidden(virtualPath string) bool {
 		if dirPath == "/" {
 			return false
 		}
-		filter := u.getPatternsFilterForPath(dirPath)
-		if filter.DenyPolicy == sdk.DenyPolicyHide && filter.Path != dirPath {
+		// The name of a directory is governed by the filter defined for its
+		// parent: the filter defined for the directory itself describes the
+		// entries it carries, not its own name.
+		filter := u.getPatternsFilterForPath(path.Dir(dirPath))
+		if filter.DenyPolicy == sdk.DenyPolicyHide {
 			if !filter.CheckAllowed(path.Base(dirPath)) {
 				return true
 			}
@@ -1506,6 +1635,14 @@ func (u *User) applyGroupSettings(groupsMapping map[string]Group) {
 
 // LoadAndApplyGroupSettings update the user by loading and applying the group settings
 func (u *User) LoadAndApplyGroupSettings() error {
+	err := u.loadAndApplyGroupSettings()
+	if u.Filters.IsAnonymous {
+		u.setAnonymousSettings()
+	}
+	return err
+}
+
+func (u *User) loadAndApplyGroupSettings() error {
 	if !u.hasSettingsFromGroups() {
 		return nil
 	}
@@ -1587,7 +1724,7 @@ func (u *User) mergeCryptFsConfig(group *Group) {
 
 func (u *User) mergeWithPrimaryGroup(group *Group, replacer *strings.Replacer) {
 	if group.UserSettings.HomeDir != "" {
-		u.HomeDir = u.replacePlaceholder(group.UserSettings.HomeDir, replacer)
+		u.HomeDir = filepath.Clean(u.replacePlaceholder(group.UserSettings.HomeDir, replacer))
 	}
 	if group.UserSettings.FsConfig.Provider != 0 {
 		u.FsConfig = u.replaceFsConfigPlaceholders(group.UserSettings.FsConfig, replacer)
@@ -1627,7 +1764,7 @@ func (u *User) mergeWithPrimaryGroup(group *Group, replacer *strings.Replacer) {
 	u.mergeAdditiveProperties(group, sdk.GroupTypePrimary, replacer)
 }
 
-func (u *User) mergePrimaryGroupFilters(filters *sdk.BaseUserFilters, replacer *strings.Replacer) { //nolint:gocyclo
+func (u *User) mergePrimaryGroupFilters(filters *sdk.BaseUserFilters, replacer *strings.Replacer) {
 	if u.Filters.MaxUploadFileSize == 0 {
 		u.Filters.MaxUploadFileSize = filters.MaxUploadFileSize
 	}
@@ -1703,10 +1840,36 @@ func (u *User) mergeVirtualFolders(group *Group, groupType int, replacer *string
 			if _, ok := folderPaths[folder.VirtualPath]; !ok {
 				folder.MappedPath = u.replacePlaceholder(folder.MappedPath, replacer)
 				folder.FsConfig = u.replaceFsConfigPlaceholders(folder.FsConfig, replacer)
+				subpath, ok := u.renderSubPathValue(folder.Subpath, replacer)
+				if !ok {
+					logger.Warn(logSender, "", "user %q: dropping folder mount %q from group %q, subpath %q renders empty or collapses",
+						u.Username, folder.VirtualPath, group.Name, folder.Subpath)
+					continue
+				}
+				folder.Subpath = subpath
 				u.VirtualFolders = append(u.VirtualFolders, folder)
 			}
 		}
 	}
+}
+
+func countPathSegments(p string) int {
+	p = util.CleanPath(p)
+	if p == "/" {
+		return 0
+	}
+	return strings.Count(p, "/")
+}
+
+func (u *User) renderSubPathValue(value string, replacer *strings.Replacer) (string, bool) {
+	if value == "" || !strings.Contains(value, "%") {
+		return value, true
+	}
+	rendered := util.CleanPath(replacer.Replace(value))
+	if countPathSegments(rendered) < countPathSegments(value) {
+		return "", false
+	}
+	return rendered, true
 }
 
 func (u *User) mergePermissions(group *Group, groupType int, replacer *strings.Replacer) {
@@ -1746,7 +1909,29 @@ func (u *User) mergeFilePatterns(group *Group, groupType int, replacer *strings.
 	}
 }
 
+func (u *User) alignVirtualFolderQuotas() {
+	if len(u.VirtualFolders) < 2 {
+		return
+	}
+	quotas := make(map[string]*vfs.VirtualFolder, len(u.VirtualFolders))
+	for idx := range u.VirtualFolders {
+		v := &u.VirtualFolders[idx]
+		if first, ok := quotas[v.Name]; ok {
+			if v.QuotaSize != first.QuotaSize || v.QuotaFiles != first.QuotaFiles {
+				logger.Warn(logSender, "", "user %q: folder %q limits on mount %q (size: %d, files: %d) replaced with the ones on mount %q (size: %d, files: %d)",
+					u.Username, v.Name, v.VirtualPath, v.QuotaSize, v.QuotaFiles,
+					first.VirtualPath, first.QuotaSize, first.QuotaFiles)
+			}
+			v.QuotaSize = first.QuotaSize
+			v.QuotaFiles = first.QuotaFiles
+		} else {
+			quotas[v.Name] = v
+		}
+	}
+}
+
 func (u *User) removeDuplicatesAfterGroupMerge() {
+	u.alignVirtualFolderQuotas()
 	u.Filters.AllowedIP = util.RemoveDuplicates(u.Filters.AllowedIP, false)
 	u.Filters.DeniedIP = util.RemoveDuplicates(u.Filters.DeniedIP, false)
 	u.Filters.DeniedLoginMethods = util.RemoveDuplicates(u.Filters.DeniedLoginMethods, false)
@@ -1762,6 +1947,17 @@ func (u *User) hasRole(role string) bool {
 		return true
 	}
 	return role == u.Role
+}
+
+func (u *User) applyNamingRules() {
+	u.Username = config.convertName(u.Username)
+	u.Role = config.convertName(u.Role)
+	for idx := range u.Groups {
+		u.Groups[idx].Name = config.convertName(u.Groups[idx].Name)
+	}
+	for idx := range u.VirtualFolders {
+		u.VirtualFolders[idx].Name = config.convertName(u.VirtualFolders[idx].Name)
+	}
 }
 
 func (u *User) getACopy() User {
@@ -1782,9 +1978,7 @@ func (u *User) getACopy() User {
 	}
 	permissions := make(map[string][]string)
 	for k, v := range u.Permissions {
-		perms := make([]string, len(v))
-		copy(perms, v)
-		permissions[k] = perms
+		permissions[k] = slices.Clone(v)
 	}
 	filters := UserFilters{
 		BaseUserFilters: copyBaseUserFilters(u.Filters.BaseUserFilters),

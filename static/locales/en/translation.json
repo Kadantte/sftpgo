@@ -71,7 +71,7 @@
         "desc": "To start using SFTPGo you need to create an administrator user",
         "submit": "Create admin and Sign in",
         "install_code_mismatch": "The installation code does not match",
-        "help_text": "SFTPGo needs your help"
+        "help_text": "Commercial support"
     },
     "login": {
         "username": "Username",
@@ -93,7 +93,6 @@
         "reset_submit": "Update Password and Sign in",
         "confirm_code": "Confirmation code",
         "reset_pwd_forbidden": "You are not allowed to reset your password",
-        "reset_pwd_no_email": "Your account does not have an email address, it is not possible to reset your password by sending an email verification code",
         "reset_pwd_send_email_err": "Unable to send confirmation code via email",
         "reset_pwd_err_generic": "Unexpected error while resetting password",
         "reset_ok_login_error": "The password reset completed successfully but an unexpected error occurred while signing in",
@@ -109,6 +108,7 @@
     },
     "general": {
         "invalid_auth_request": "The authentication request does not meet security requirements",
+        "invalid_input": "Invalid input. Slashes (/ ), colons (:), control characters, and reserved system names are not allowed",
         "error400": "The received request is not valid",
         "error403": "You do not have the required permissions",
         "error404": "The requested resource does not exist",
@@ -156,6 +156,7 @@
         "datetime": "{{- val, datetime}}",
         "selected_items_one": "{{count}} item selected",
         "selected_items_other": "{{count}} items selected",
+        "selected_with_placeholder": "%d items selected",
         "name_required": "Name is required",
         "name_different": "The new name must be different from the current name",
         "html5_media_not_supported": "Your browser does not support HTML5 audio/video.",
@@ -301,6 +302,7 @@
         "err_429": "Too many concurrent requests",
         "err_generic": "Unable to access the requested resource",
         "err_validation": "Invalid filesystem configuration",
+        "err_secret_entropy": "The encryption secret must be high-entropy random key material produced by a secure random generator",
         "err_exists": "The destination already exists",
         "dir_list": {
             "err_generic": "Failed to get directory listing",
@@ -498,7 +500,7 @@
     "user": {
         "view_manage": "View and manage users",
         "username_reserved": "The specified username is reserved",
-        "username_invalid": "The specified username is not valid, the following characters are allowed: a-zA-Z0-9-_.~",
+        "username_invalid": "The specified name is not valid, the following characters are allowed: a-z A-Z 0-9 - _ . ~",
         "home_required": "The home directory is mandatory",
         "home_invalid": "The home directory must be an absolute path",
         "pub_key_invalid": "Invalid public key",
@@ -515,6 +517,7 @@
         "folder_path_required": "The virtual folder mount path is required",
         "folder_duplicated": "Duplicated virtual folders detected",
         "folder_overlapped": "Overlapping virtual folders detected",
+        "folder_quota_mismatch": "Quota limits apply to the whole virtual folder, all mounts of the same folder must use the same values",
         "folder_quota_size_invalid": "The quota as size of virtual folders must be greater than or equal to -1",
         "folder_quota_file_invalid": "The quota as files of virtual folders must be greater than or equal to -1",
         "folder_quota_invalid": "Quotas as size and as number of files of virtual folders must be both -1 or greater or equal than 0",
@@ -571,7 +574,9 @@
         "template_name_placeholder": "replaced with the name of the specified virtual folder",
         "template_help": "The generated virtual folders can be saved or exported. Exported folders can be imported from the \"Maintenance\" section of this SFTPGo instance or another.",
         "name": "Virtual folder name",
-        "template_no_folder": "No valid virtual folder defined, unable to complete the requested action"
+        "template_no_folder": "No valid virtual folder defined, unable to complete the requested action",
+        "subpath": "sub-path, i.e. /subdir",
+        "subpath_help": "Mount the folder re-rooted at this sub-path"
     },
     "storage": {
         "title": "File system",
@@ -647,7 +652,7 @@
         "fs_error": "Filesystem configuration error",
         "bucket_required": "$t(storage.fs_error): bucket is required",
         "region_required": "$t(storage.fs_error): region is required",
-        "key_prefix_invalid": "$t(storage.fs_error): invalid key prefix, cannot start with \"/\"",
+        "key_prefix_invalid": "$t(storage.fs_error): invalid key prefix, it cannot point to the storage root",
         "ul_part_size_invalid": "$t(storage.fs_error): invalid upload part size",
         "ul_concurrency_invalid": "$t(storage.fs_error): invalid upload concurrency",
         "dl_part_size_invalid": "$t(storage.fs_error): invalid download part size",
@@ -1103,14 +1108,14 @@
         "status_filters": "Status filters",
         "object_filters": "Object filters",
         "name_filters": "Name filters",
-        "name_filters_help": "Shell-like pattern filters for usernames, folder names. For example \"user*\"\" will match names starting with \"user\". For provider events, this filter is applied to the username of the admin executing the event",
+        "name_filters_help": "Shell-like pattern filters for usernames. For scheduled folder quota reset actions they match folder names. For provider events they match the username of the admin executing the event. For example \"user*\" matches names starting with \"user\"",
         "inverse_match": "Inverse match",
         "group_name_filters": "Group name filters",
-        "group_name_filters_help": "Shell-like pattern filters for group names. For example \"group*\"\" will match group names starting with \"group\"",
+        "group_name_filters_help": "Shell-like pattern filters for group names. For example \"group*\" will match group names starting with \"group\"",
         "role_name_filters": "Role name filters",
-        "role_name_filters_help": "Shell-like pattern filters for role names. For example \"role*\"\" will match role names starting with \"role\"",
+        "role_name_filters_help": "Shell-like pattern filters for role names. For example \"role*\" will match role names starting with \"role\"",
         "path_filters": "Path filters",
-        "path_filters_help": "Shell-like pattern filters on filesystem event paths. For example \"/adir/*.txt\"\" will match paths in the \"/adir\" directory ending with \".txt\". Double asterisk is supported, for example \"/**/*.txt\" will match any file ending with \".txt\". \"/mydir/**\" will match any entry in \"/mydir\"",
+        "path_filters_help": "Shell-like pattern filters on filesystem event paths. For example \"/adir/*.txt\" will match paths in the \"/adir\" directory ending with \".txt\". Double asterisk is supported, for example \"/**/*.txt\" will match any file ending with \".txt\". \"/mydir/**\" will match any entry in \"/mydir\"",
         "file_size_limits": "File size limits",
         "file_size_limits_help": "0 means no limit. You can use MB/GB suffix",
         "min_size": "Minimum size",

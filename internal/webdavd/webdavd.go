@@ -21,6 +21,10 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
+	"slices"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-chi/chi/v5/middleware"
@@ -43,9 +47,10 @@ const (
 )
 
 var (
-	certMgr       *common.CertManager
-	serviceStatus ServiceStatus
-	timeFormats   = []string{
+	certMgr         atomic.Pointer[common.CertManager]
+	serviceStatus   ServiceStatus
+	serviceStatusMu sync.RWMutex
+	timeFormats     = []string{
 		http.TimeFormat,
 		"Mon, _2 Jan 2006 15:04:05 GMT",
 		time.RFC850,
@@ -176,12 +181,21 @@ func (b *Binding) isMutualTLSEnabled() bool {
 
 // GetAddress returns the binding address
 func (b *Binding) GetAddress() string {
-	return fmt.Sprintf("%s:%d", b.Address, b.Port)
+	if b.Port > 0 {
+		return fmt.Sprintf("%s:%d", b.Address, b.Port)
+	}
+	return b.Address
 }
 
-// IsValid returns true if the binding port is > 0
+// IsValid returns true if the binding is valid
 func (b *Binding) IsValid() bool {
-	return b.Port > 0
+	if b.Port > 0 {
+		return true
+	}
+	if filepath.IsAbs(b.Address) && runtime.GOOS != "windows" {
+		return true
+	}
+	return false
 }
 
 func (b *Binding) listenerWrapper() func(net.Listener) (net.Listener, error) {
@@ -213,9 +227,37 @@ type Configuration struct {
 	acmeDomain string
 }
 
+func resetServiceStatus() {
+	serviceStatusMu.Lock()
+	defer serviceStatusMu.Unlock()
+
+	serviceStatus = ServiceStatus{
+		Bindings: nil,
+	}
+}
+
+func addServiceStatusBinding(binding Binding) {
+	serviceStatusMu.Lock()
+	defer serviceStatusMu.Unlock()
+
+	serviceStatus.Bindings = append(serviceStatus.Bindings, binding)
+}
+
+func setServiceStatusActive() {
+	serviceStatusMu.Lock()
+	defer serviceStatusMu.Unlock()
+
+	serviceStatus.IsActive = true
+}
+
 // GetStatus returns the server status
 func GetStatus() ServiceStatus {
-	return serviceStatus
+	serviceStatusMu.RLock()
+	defer serviceStatusMu.RUnlock()
+
+	status := serviceStatus
+	status.Bindings = slices.Clone(serviceStatus.Bindings)
+	return status
 }
 
 // ShouldBind returns true if there is at least a valid binding
@@ -329,14 +371,12 @@ func (c *Configuration) Initialize(configDir string) error {
 		if err := mgr.LoadCRLs(); err != nil {
 			return err
 		}
-		certMgr = mgr
+		certMgr.Store(mgr)
 	}
 	compressor := middleware.NewCompressor(5, "text/*")
 	dataprovider.InitializeWebDAVUserCache(c.Cache.Users.MaxSize)
 
-	serviceStatus = ServiceStatus{
-		Bindings: nil,
-	}
+	resetServiceStatus()
 
 	exitChannel := make(chan error, 1)
 
@@ -357,15 +397,15 @@ func (c *Configuration) Initialize(configDir string) error {
 		}(binding)
 	}
 
-	serviceStatus.IsActive = true
+	setServiceStatusActive()
 
 	return <-exitChannel
 }
 
 // ReloadCertificateMgr reloads the certificate manager
 func ReloadCertificateMgr() error {
-	if certMgr != nil {
-		return certMgr.Reload()
+	if mgr := certMgr.Load(); mgr != nil {
+		return mgr.Reload()
 	}
 	return nil
 }

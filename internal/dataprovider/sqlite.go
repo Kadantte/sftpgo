@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -36,11 +37,11 @@ import (
 
 const (
 	sqliteResetSQL = `DROP TABLE IF EXISTS "{{api_keys}}";
-DROP TABLE IF EXISTS "{{folders_mapping}}";
 DROP TABLE IF EXISTS "{{users_folders_mapping}}";
 DROP TABLE IF EXISTS "{{users_groups_mapping}}";
 DROP TABLE IF EXISTS "{{admins_groups_mapping}}";
 DROP TABLE IF EXISTS "{{groups_folders_mapping}}";
+DROP TABLE IF EXISTS "{{shares_groups_mapping}}";
 DROP TABLE IF EXISTS "{{admins}}";
 DROP TABLE IF EXISTS "{{folders}}";
 DROP TABLE IF EXISTS "{{shares}}";
@@ -82,8 +83,8 @@ CREATE TABLE "{{folders}}" ("id" integer NOT NULL PRIMARY KEY, "name" varchar(25
 "last_quota_update" bigint NOT NULL, "filesystem" text NULL);
 CREATE TABLE "{{groups}}" ("id" integer NOT NULL PRIMARY KEY, "name" varchar(255) NOT NULL UNIQUE,
 "description" varchar(512) NULL, "created_at" bigint NOT NULL, "updated_at" bigint NOT NULL, "user_settings" text NULL);
-CREATE TABLE "{{shared_sessions}}" ("key" varchar(128) NOT NULL PRIMARY KEY, "data" text NOT NULL,
-"type" integer NOT NULL, "timestamp" bigint NOT NULL);
+CREATE TABLE "{{shared_sessions}}" ("key" varchar(128) NOT NULL, "type" integer NOT NULL,
+"data" text NOT NULL, "timestamp" bigint NOT NULL, PRIMARY KEY ("key", "type"));
 CREATE TABLE "{{users}}" ("id" integer NOT NULL PRIMARY KEY, "username" varchar(255) NOT NULL UNIQUE,
 "status" integer NOT NULL, "expiration_date" bigint NOT NULL, "description" varchar(512) NULL, "password" text NULL,
 "public_keys" text NULL, "home_dir" text NOT NULL, "uid" bigint NOT NULL, "gid" bigint NOT NULL,
@@ -98,21 +99,21 @@ CREATE TABLE "{{users}}" ("id" integer NOT NULL PRIMARY KEY, "username" varchar(
 CREATE TABLE "{{groups_folders_mapping}}" ("id" integer NOT NULL PRIMARY KEY,
 "folder_id" integer NOT NULL REFERENCES "{{folders}}" ("id") ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED,
 "group_id" integer NOT NULL REFERENCES "{{groups}}" ("id") ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED,
-"virtual_path" text NOT NULL, "quota_size" bigint NOT NULL, "quota_files" integer NOT NULL,
+"virtual_path" text NOT NULL, "quota_size" bigint NOT NULL, "quota_files" integer NOT NULL, "sort_order" integer NOT NULL,
 CONSTRAINT "{{prefix}}unique_group_folder_mapping" UNIQUE ("group_id", "folder_id"));
 CREATE TABLE "{{users_groups_mapping}}" ("id" integer NOT NULL PRIMARY KEY,
 "user_id" integer NOT NULL REFERENCES "{{users}}" ("id") ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED,
 "group_id" integer NOT NULL REFERENCES "{{groups}}" ("id") ON DELETE NO ACTION,
-"group_type" integer NOT NULL, CONSTRAINT "{{prefix}}unique_user_group_mapping" UNIQUE ("user_id", "group_id"));
+"group_type" integer NOT NULL, "sort_order" integer NOT NULL, CONSTRAINT "{{prefix}}unique_user_group_mapping" UNIQUE ("user_id", "group_id"));
 CREATE TABLE "{{users_folders_mapping}}" ("id" integer NOT NULL PRIMARY KEY,
 "user_id" integer NOT NULL REFERENCES "{{users}}" ("id") ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED,
 "folder_id" integer NOT NULL REFERENCES "{{folders}}" ("id") ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED,
-"virtual_path" text NOT NULL, "quota_size" bigint NOT NULL, "quota_files" integer NOT NULL,
+"virtual_path" text NOT NULL, "quota_size" bigint NOT NULL, "quota_files" integer NOT NULL, "sort_order" integer NOT NULL,
 CONSTRAINT "{{prefix}}unique_user_folder_mapping" UNIQUE ("user_id", "folder_id"));
 CREATE TABLE "{{shares}}" ("id" integer NOT NULL PRIMARY KEY, "share_id" varchar(60) NOT NULL UNIQUE,
 "name" varchar(255) NOT NULL, "description" varchar(512) NULL, "scope" integer NOT NULL, "paths" text NOT NULL,
 "created_at" bigint NOT NULL, "updated_at" bigint NOT NULL, "last_use_at" bigint NOT NULL, "expires_at" bigint NOT NULL,
-"password" text NULL, "max_tokens" integer NOT NULL, "used_tokens" integer NOT NULL, "allow_from" text NULL,
+"password" text NULL, "max_tokens" integer NOT NULL, "used_tokens" integer NOT NULL, "allow_from" text NULL, "options" text NULL,
 "user_id" integer NOT NULL REFERENCES "{{users}}" ("id") ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED);
 CREATE TABLE "{{api_keys}}" ("id" integer NOT NULL PRIMARY KEY, "name" varchar(255) NOT NULL,
 "key_id" varchar(50) NOT NULL UNIQUE, "api_key" varchar(255) NOT NULL UNIQUE, "scope" integer NOT NULL,
@@ -134,7 +135,7 @@ CREATE TABLE "{{tasks}}" ("id" integer NOT NULL PRIMARY KEY, "name" varchar(255)
 CREATE TABLE "{{admins_groups_mapping}}" ("id" integer NOT NULL PRIMARY KEY,
 "admin_id" integer NOT NULL REFERENCES "{{admins}}" ("id") ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED,
 "group_id" integer NOT NULL REFERENCES "{{groups}}" ("id") ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED,
-"options" text NOT NULL, CONSTRAINT "{{prefix}}unique_admin_group_mapping" UNIQUE ("admin_id", "group_id"));
+"options" text NOT NULL, "sort_order" integer NOT NULL, CONSTRAINT "{{prefix}}unique_admin_group_mapping" UNIQUE ("admin_id", "group_id"));
 CREATE TABLE "{{ip_lists}}" ("id" integer NOT NULL PRIMARY KEY,
 "type" integer NOT NULL, "ipornet" varchar(50) NOT NULL, "mode" integer NOT NULL, "description" varchar(512) NULL,
 "first" BLOB NOT NULL, "last" BLOB NOT NULL, "ip_type" integer NOT NULL, "protocols" integer NOT NULL,
@@ -144,10 +145,13 @@ CREATE TABLE "{{configs}}" ("id" integer NOT NULL PRIMARY KEY, "configs" text NO
 INSERT INTO {{configs}} (configs) VALUES ('{}');
 CREATE INDEX "{{prefix}}users_folders_mapping_folder_id_idx" ON "{{users_folders_mapping}}" ("folder_id");
 CREATE INDEX "{{prefix}}users_folders_mapping_user_id_idx" ON "{{users_folders_mapping}}" ("user_id");
+CREATE INDEX "{{prefix}}users_folders_mapping_sort_order_idx" ON "{{users_folders_mapping}}" ("sort_order");
 CREATE INDEX "{{prefix}}users_groups_mapping_group_id_idx" ON "{{users_groups_mapping}}" ("group_id");
 CREATE INDEX "{{prefix}}users_groups_mapping_user_id_idx" ON "{{users_groups_mapping}}" ("user_id");
+CREATE INDEX "{{prefix}}users_groups_mapping_sort_order_idx" ON "{{users_groups_mapping}}" ("sort_order");
 CREATE INDEX "{{prefix}}groups_folders_mapping_folder_id_idx" ON "{{groups_folders_mapping}}" ("folder_id");
 CREATE INDEX "{{prefix}}groups_folders_mapping_group_id_idx" ON "{{groups_folders_mapping}}" ("group_id");
+CREATE INDEX "{{prefix}}groups_folders_mapping_sort_order_idx" ON "{{groups_folders_mapping}}" ("sort_order");
 CREATE INDEX "{{prefix}}api_keys_admin_id_idx" ON "{{api_keys}}" ("admin_id");
 CREATE INDEX "{{prefix}}api_keys_user_id_idx" ON "{{api_keys}}" ("user_id");
 CREATE INDEX "{{prefix}}users_updated_at_idx" ON "{{users}}" ("updated_at");
@@ -170,6 +174,7 @@ CREATE INDEX "{{prefix}}rules_actions_mapping_action_id_idx" ON "{{rules_actions
 CREATE INDEX "{{prefix}}rules_actions_mapping_order_idx" ON "{{rules_actions_mapping}}" ("order");
 CREATE INDEX "{{prefix}}admins_groups_mapping_admin_id_idx" ON "{{admins_groups_mapping}}" ("admin_id");
 CREATE INDEX "{{prefix}}admins_groups_mapping_group_id_idx" ON "{{admins_groups_mapping}}" ("group_id");
+CREATE INDEX "{{prefix}}admins_groups_mapping_sort_order_idx" ON "{{admins_groups_mapping}}" ("sort_order");
 CREATE INDEX "{{prefix}}users_role_id_idx" ON "{{users}}" ("role_id");
 CREATE INDEX "{{prefix}}admins_role_id_idx" ON "{{admins}}" ("role_id");
 CREATE INDEX "{{prefix}}ip_lists_type_idx" ON "{{ip_lists}}" ("type");
@@ -178,21 +183,253 @@ CREATE INDEX "{{prefix}}ip_lists_ip_type_idx" ON "{{ip_lists}}" ("ip_type");
 CREATE INDEX "{{prefix}}ip_lists_ip_updated_at_idx" ON "{{ip_lists}}" ("updated_at");
 CREATE INDEX "{{prefix}}ip_lists_ip_deleted_at_idx" ON "{{ip_lists}}" ("deleted_at");
 CREATE INDEX "{{prefix}}ip_lists_first_last_idx" ON "{{ip_lists}}" ("first", "last");
-INSERT INTO {{schema_version}} (version) VALUES (29);
+INSERT INTO {{schema_version}} (version) VALUES (33);
 `
-	sqliteV30SQL     = `ALTER TABLE "{{shares}}" ADD COLUMN "options" text NULL;`
-	sqliteV30DownSQL = `ALTER TABLE "{{shares}}" DROP COLUMN "options";`
-	sqliteV31SQL     = `DROP TABLE "{{shared_sessions}}";
-CREATE TABLE "{{shared_sessions}}" ("key" varchar(128) NOT NULL, "type" integer NOT NULL,
-"data" text NOT NULL, "timestamp" bigint NOT NULL, PRIMARY KEY ("key", "type"));
-CREATE INDEX "{{prefix}}shared_sessions_type_idx" ON "{{shared_sessions}}" ("type");
-CREATE INDEX "{{prefix}}shared_sessions_timestamp_idx" ON "{{shared_sessions}}" ("timestamp");
+	sqliteV34SQL = `
+CREATE TABLE "{{shares_groups_mapping}}" (
+    "id" integer NOT NULL PRIMARY KEY AUTOINCREMENT,
+    "share_id" integer NOT NULL REFERENCES "{{shares}}" ("id") ON DELETE CASCADE,
+    "group_id" integer NOT NULL REFERENCES "{{groups}}" ("id") ON DELETE CASCADE,
+    "permissions" integer NOT NULL,
+    "sort_order" integer NOT NULL,
+    CONSTRAINT "{{prefix}}unique_share_group_mapping" UNIQUE ("share_id", "group_id")
+);
+CREATE INDEX "{{prefix}}shares_groups_mapping_sort_order_idx" ON "{{shares_groups_mapping}}" ("sort_order");
+CREATE INDEX "{{prefix}}shares_groups_mapping_group_id_idx" ON "{{shares_groups_mapping}}" ("group_id");
+CREATE INDEX "{{prefix}}shares_groups_mapping_share_id_idx" ON "{{shares_groups_mapping}}" ("share_id");
 `
-	sqliteV31DownSQL = `DROP TABLE "{{shared_sessions}}";
-CREATE TABLE "{{shared_sessions}}" ("key" varchar(128) NOT NULL PRIMARY KEY, "data" text NOT NULL,
-"type" integer NOT NULL, "timestamp" bigint NOT NULL);
-CREATE INDEX "{{prefix}}shared_sessions_type_idx" ON "{{shared_sessions}}" ("type");
-CREATE INDEX "{{prefix}}shared_sessions_timestamp_idx" ON "{{shared_sessions}}" ("timestamp");
+	sqliteV34DownSQL = `DROP TABLE IF EXISTS "{{shares_groups_mapping}}";`
+	sqliteV35SQL     = `CREATE TABLE "{{users_folders_mapping}}_new" ("id" integer NOT NULL PRIMARY KEY,
+"user_id" integer NOT NULL REFERENCES "{{users}}" ("id") ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED,
+"folder_id" integer NOT NULL REFERENCES "{{folders}}" ("id") ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED,
+"virtual_path" text NOT NULL, "quota_size" bigint NOT NULL, "quota_files" integer NOT NULL,
+"sort_order" integer DEFAULT 0 NOT NULL, "exposed_subpaths" text NULL, "subpath" text DEFAULT '' NOT NULL,
+CONSTRAINT "{{prefix}}unique_user_folder_mapping" UNIQUE ("user_id", "folder_id", "subpath"));
+INSERT INTO "{{users_folders_mapping}}_new" ("id", "user_id", "folder_id", "virtual_path", "quota_size", "quota_files", "sort_order")
+SELECT "id", "user_id", "folder_id", "virtual_path", "quota_size", "quota_files", "sort_order" FROM "{{users_folders_mapping}}";
+DROP TABLE "{{users_folders_mapping}}";
+ALTER TABLE "{{users_folders_mapping}}_new" RENAME TO "{{users_folders_mapping}}";
+CREATE INDEX "{{prefix}}users_folders_mapping_folder_id_idx" ON "{{users_folders_mapping}}" ("folder_id");
+CREATE INDEX "{{prefix}}users_folders_mapping_user_id_idx" ON "{{users_folders_mapping}}" ("user_id");
+CREATE INDEX "{{prefix}}users_folders_mapping_sort_order_idx" ON "{{users_folders_mapping}}" ("sort_order");
+CREATE TABLE "{{groups_folders_mapping}}_new" ("id" integer NOT NULL PRIMARY KEY,
+"folder_id" integer NOT NULL REFERENCES "{{folders}}" ("id") ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED,
+"group_id" integer NOT NULL REFERENCES "{{groups}}" ("id") ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED,
+"virtual_path" text NOT NULL, "quota_size" bigint NOT NULL, "quota_files" integer NOT NULL,
+"sort_order" integer DEFAULT 0 NOT NULL, "exposed_subpaths" text NULL, "subpath" text DEFAULT '' NOT NULL,
+CONSTRAINT "{{prefix}}unique_group_folder_mapping" UNIQUE ("group_id", "folder_id", "subpath"));
+INSERT INTO "{{groups_folders_mapping}}_new" ("id", "folder_id", "group_id", "virtual_path", "quota_size", "quota_files", "sort_order")
+SELECT "id", "folder_id", "group_id", "virtual_path", "quota_size", "quota_files", "sort_order" FROM "{{groups_folders_mapping}}";
+DROP TABLE "{{groups_folders_mapping}}";
+ALTER TABLE "{{groups_folders_mapping}}_new" RENAME TO "{{groups_folders_mapping}}";
+CREATE INDEX "{{prefix}}groups_folders_mapping_folder_id_idx" ON "{{groups_folders_mapping}}" ("folder_id");
+CREATE INDEX "{{prefix}}groups_folders_mapping_group_id_idx" ON "{{groups_folders_mapping}}" ("group_id");
+CREATE INDEX "{{prefix}}groups_folders_mapping_sort_order_idx" ON "{{groups_folders_mapping}}" ("sort_order");
+`
+	sqliteV35DownSQL = `CREATE TABLE "{{users_folders_mapping}}_new" ("id" integer NOT NULL PRIMARY KEY,
+"user_id" integer NOT NULL REFERENCES "{{users}}" ("id") ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED,
+"folder_id" integer NOT NULL REFERENCES "{{folders}}" ("id") ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED,
+"virtual_path" text NOT NULL, "quota_size" bigint NOT NULL, "quota_files" integer NOT NULL,
+"sort_order" integer DEFAULT 0 NOT NULL,
+CONSTRAINT "{{prefix}}unique_user_folder_mapping" UNIQUE ("user_id", "folder_id"));
+INSERT INTO "{{users_folders_mapping}}_new" ("id", "user_id", "folder_id", "virtual_path", "quota_size", "quota_files", "sort_order")
+SELECT "id", "user_id", "folder_id", "virtual_path", "quota_size", "quota_files", "sort_order" FROM "{{users_folders_mapping}}";
+DROP TABLE "{{users_folders_mapping}}";
+ALTER TABLE "{{users_folders_mapping}}_new" RENAME TO "{{users_folders_mapping}}";
+CREATE INDEX "{{prefix}}users_folders_mapping_folder_id_idx" ON "{{users_folders_mapping}}" ("folder_id");
+CREATE INDEX "{{prefix}}users_folders_mapping_user_id_idx" ON "{{users_folders_mapping}}" ("user_id");
+CREATE INDEX "{{prefix}}users_folders_mapping_sort_order_idx" ON "{{users_folders_mapping}}" ("sort_order");
+CREATE TABLE "{{groups_folders_mapping}}_new" ("id" integer NOT NULL PRIMARY KEY,
+"folder_id" integer NOT NULL REFERENCES "{{folders}}" ("id") ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED,
+"group_id" integer NOT NULL REFERENCES "{{groups}}" ("id") ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED,
+"virtual_path" text NOT NULL, "quota_size" bigint NOT NULL, "quota_files" integer NOT NULL,
+"sort_order" integer DEFAULT 0 NOT NULL,
+CONSTRAINT "{{prefix}}unique_group_folder_mapping" UNIQUE ("group_id", "folder_id"));
+INSERT INTO "{{groups_folders_mapping}}_new" ("id", "folder_id", "group_id", "virtual_path", "quota_size", "quota_files", "sort_order")
+SELECT "id", "folder_id", "group_id", "virtual_path", "quota_size", "quota_files", "sort_order" FROM "{{groups_folders_mapping}}";
+DROP TABLE "{{groups_folders_mapping}}";
+ALTER TABLE "{{groups_folders_mapping}}_new" RENAME TO "{{groups_folders_mapping}}";
+CREATE INDEX "{{prefix}}groups_folders_mapping_folder_id_idx" ON "{{groups_folders_mapping}}" ("folder_id");
+CREATE INDEX "{{prefix}}groups_folders_mapping_group_id_idx" ON "{{groups_folders_mapping}}" ("group_id");
+CREATE INDEX "{{prefix}}groups_folders_mapping_sort_order_idx" ON "{{groups_folders_mapping}}" ("sort_order");
+`
+	sqliteV36SQL = `ALTER TABLE "{{groups}}" ADD COLUMN "role_id" integer NULL REFERENCES "{{roles}}" ("id") ON DELETE NO ACTION;
+ALTER TABLE "{{folders}}" ADD COLUMN "role_id" integer NULL REFERENCES "{{roles}}" ("id") ON DELETE NO ACTION;
+CREATE INDEX "{{prefix}}groups_role_id_idx" ON "{{groups}}" ("role_id");
+CREATE INDEX "{{prefix}}folders_role_id_idx" ON "{{folders}}" ("role_id");
+ALTER TABLE "{{roles}}" ADD COLUMN "resource_isolation" integer DEFAULT 0 NOT NULL;
+ALTER TABLE "{{roles}}" ADD COLUMN "settings" text NULL;
+CREATE TABLE "{{users_folders_mapping}}_new" ("id" integer NOT NULL PRIMARY KEY,
+"user_id" integer NOT NULL REFERENCES "{{users}}" ("id") ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED,
+"folder_id" integer NOT NULL REFERENCES "{{folders}}" ("id") ON DELETE NO ACTION DEFERRABLE INITIALLY DEFERRED,
+"virtual_path" text NOT NULL, "quota_size" bigint NOT NULL, "quota_files" integer NOT NULL,
+"sort_order" integer NOT NULL, "exposed_subpaths" text NULL, "subpath" text DEFAULT '' NOT NULL,
+CONSTRAINT "{{prefix}}unique_user_folder_mapping" UNIQUE ("user_id", "folder_id", "subpath"));
+INSERT INTO "{{users_folders_mapping}}_new" ("id", "user_id", "folder_id", "virtual_path", "quota_size",
+"quota_files", "sort_order", "exposed_subpaths", "subpath")
+SELECT "id", "user_id", "folder_id", "virtual_path", "quota_size", "quota_files", "sort_order",
+"exposed_subpaths", "subpath" FROM "{{users_folders_mapping}}";
+DROP TABLE "{{users_folders_mapping}}";
+ALTER TABLE "{{users_folders_mapping}}_new" RENAME TO "{{users_folders_mapping}}";
+CREATE INDEX "{{prefix}}users_folders_mapping_folder_id_idx" ON "{{users_folders_mapping}}" ("folder_id");
+CREATE INDEX "{{prefix}}users_folders_mapping_user_id_idx" ON "{{users_folders_mapping}}" ("user_id");
+CREATE INDEX "{{prefix}}users_folders_mapping_sort_order_idx" ON "{{users_folders_mapping}}" ("sort_order");
+CREATE TABLE "{{groups_folders_mapping}}_new" ("id" integer NOT NULL PRIMARY KEY,
+"folder_id" integer NOT NULL REFERENCES "{{folders}}" ("id") ON DELETE NO ACTION DEFERRABLE INITIALLY DEFERRED,
+"group_id" integer NOT NULL REFERENCES "{{groups}}" ("id") ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED,
+"virtual_path" text NOT NULL, "quota_size" bigint NOT NULL, "quota_files" integer NOT NULL,
+"sort_order" integer NOT NULL, "exposed_subpaths" text NULL, "subpath" text DEFAULT '' NOT NULL,
+CONSTRAINT "{{prefix}}unique_group_folder_mapping" UNIQUE ("group_id", "folder_id", "subpath"));
+INSERT INTO "{{groups_folders_mapping}}_new" ("id", "folder_id", "group_id", "virtual_path", "quota_size",
+"quota_files", "sort_order", "exposed_subpaths", "subpath")
+SELECT "id", "folder_id", "group_id", "virtual_path", "quota_size", "quota_files", "sort_order",
+"exposed_subpaths", "subpath" FROM "{{groups_folders_mapping}}";
+DROP TABLE "{{groups_folders_mapping}}";
+ALTER TABLE "{{groups_folders_mapping}}_new" RENAME TO "{{groups_folders_mapping}}";
+CREATE INDEX "{{prefix}}groups_folders_mapping_folder_id_idx" ON "{{groups_folders_mapping}}" ("folder_id");
+CREATE INDEX "{{prefix}}groups_folders_mapping_group_id_idx" ON "{{groups_folders_mapping}}" ("group_id");
+CREATE INDEX "{{prefix}}groups_folders_mapping_sort_order_idx" ON "{{groups_folders_mapping}}" ("sort_order");
+CREATE TABLE "{{admins_groups_mapping}}_new" ("id" integer NOT NULL PRIMARY KEY,
+"admin_id" integer NOT NULL REFERENCES "{{admins}}" ("id") ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED,
+"group_id" integer NOT NULL REFERENCES "{{groups}}" ("id") ON DELETE NO ACTION DEFERRABLE INITIALLY DEFERRED,
+"options" text NOT NULL, "sort_order" integer NOT NULL,
+CONSTRAINT "{{prefix}}unique_admin_group_mapping" UNIQUE ("admin_id", "group_id"));
+INSERT INTO "{{admins_groups_mapping}}_new" ("id", "admin_id", "group_id", "options", "sort_order")
+SELECT "id", "admin_id", "group_id", "options", "sort_order" FROM "{{admins_groups_mapping}}";
+DROP TABLE "{{admins_groups_mapping}}";
+ALTER TABLE "{{admins_groups_mapping}}_new" RENAME TO "{{admins_groups_mapping}}";
+CREATE INDEX "{{prefix}}admins_groups_mapping_admin_id_idx" ON "{{admins_groups_mapping}}" ("admin_id");
+CREATE INDEX "{{prefix}}admins_groups_mapping_group_id_idx" ON "{{admins_groups_mapping}}" ("group_id");
+CREATE INDEX "{{prefix}}admins_groups_mapping_sort_order_idx" ON "{{admins_groups_mapping}}" ("sort_order");
+CREATE TABLE "{{users_groups_mapping}}_new" ("id" integer NOT NULL PRIMARY KEY,
+"user_id" integer NOT NULL REFERENCES "{{users}}" ("id") ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED,
+"group_id" integer NOT NULL REFERENCES "{{groups}}" ("id") ON DELETE NO ACTION,
+"group_type" integer NOT NULL, "sort_order" integer NOT NULL,
+CONSTRAINT "{{prefix}}unique_user_group_mapping" UNIQUE ("user_id", "group_id"));
+INSERT INTO "{{users_groups_mapping}}_new" ("id", "user_id", "group_id", "group_type", "sort_order")
+SELECT "id", "user_id", "group_id", "group_type", "sort_order" FROM "{{users_groups_mapping}}";
+DROP TABLE "{{users_groups_mapping}}";
+ALTER TABLE "{{users_groups_mapping}}_new" RENAME TO "{{users_groups_mapping}}";
+CREATE INDEX "{{prefix}}users_groups_mapping_group_id_idx" ON "{{users_groups_mapping}}" ("group_id");
+CREATE INDEX "{{prefix}}users_groups_mapping_user_id_idx" ON "{{users_groups_mapping}}" ("user_id");
+CREATE INDEX "{{prefix}}users_groups_mapping_sort_order_idx" ON "{{users_groups_mapping}}" ("sort_order");
+CREATE TABLE "{{users}}_new" ("id" integer NOT NULL PRIMARY KEY, "username" varchar(255) NOT NULL UNIQUE,
+"status" integer NOT NULL, "expiration_date" bigint NOT NULL, "description" varchar(512) NULL, "password" text NULL,
+"public_keys" text NULL, "home_dir" text NOT NULL, "uid" bigint NOT NULL, "gid" bigint NOT NULL,
+"max_sessions" integer NOT NULL, "quota_size" bigint NOT NULL, "quota_files" integer NOT NULL, "permissions" text NOT NULL,
+"used_quota_size" bigint NOT NULL, "used_quota_files" integer NOT NULL, "last_quota_update" bigint NOT NULL,
+"upload_bandwidth" integer NOT NULL, "download_bandwidth" integer NOT NULL, "last_login" bigint NOT NULL,
+"filters" text NULL, "filesystem" text NULL, "additional_info" text NULL, "created_at" bigint NOT NULL,
+"updated_at" bigint NOT NULL, "email" varchar(255) NULL, "upload_data_transfer" integer NOT NULL,
+"download_data_transfer" integer NOT NULL, "total_data_transfer" integer NOT NULL, "used_upload_data_transfer" bigint NOT NULL,
+"used_download_data_transfer" bigint NOT NULL, "deleted_at" bigint NOT NULL, "first_download" bigint NOT NULL,
+"first_upload" bigint NOT NULL, "last_password_change" bigint NOT NULL, "role_id" integer NULL REFERENCES "{{roles}}" ("id") ON DELETE NO ACTION);
+INSERT INTO "{{users}}_new" ("id", "username", "status", "expiration_date", "description", "password", "public_keys", "home_dir", "uid", "gid",
+"max_sessions", "quota_size", "quota_files", "permissions", "used_quota_size", "used_quota_files",
+"last_quota_update", "upload_bandwidth", "download_bandwidth", "last_login", "filters", "filesystem",
+"additional_info", "created_at", "updated_at", "email", "upload_data_transfer", "download_data_transfer",
+"total_data_transfer", "used_upload_data_transfer", "used_download_data_transfer", "deleted_at", "first_download",
+"first_upload", "last_password_change", "role_id")
+SELECT "id", "username", "status", "expiration_date", "description", "password", "public_keys", "home_dir", "uid", "gid",
+"max_sessions", "quota_size", "quota_files", "permissions", "used_quota_size", "used_quota_files",
+"last_quota_update", "upload_bandwidth", "download_bandwidth", "last_login", "filters", "filesystem",
+"additional_info", "created_at", "updated_at", "email", "upload_data_transfer", "download_data_transfer",
+"total_data_transfer", "used_upload_data_transfer", "used_download_data_transfer", "deleted_at", "first_download",
+"first_upload", "last_password_change", "role_id" FROM "{{users}}";
+DROP TABLE "{{users}}";
+ALTER TABLE "{{users}}_new" RENAME TO "{{users}}";
+CREATE INDEX "{{prefix}}users_updated_at_idx" ON "{{users}}" ("updated_at");
+CREATE INDEX "{{prefix}}users_deleted_at_idx" ON "{{users}}" ("deleted_at");
+CREATE INDEX "{{prefix}}users_role_id_idx" ON "{{users}}" ("role_id");
+`
+	sqliteV36DownSQL = `DROP INDEX "{{prefix}}groups_role_id_idx";
+DROP INDEX "{{prefix}}folders_role_id_idx";
+ALTER TABLE "{{groups}}" DROP COLUMN "role_id";
+ALTER TABLE "{{folders}}" DROP COLUMN "role_id";
+ALTER TABLE "{{roles}}" DROP COLUMN "settings";
+ALTER TABLE "{{roles}}" DROP COLUMN "resource_isolation";
+CREATE TABLE "{{users_folders_mapping}}_new" ("id" integer NOT NULL PRIMARY KEY,
+"user_id" integer NOT NULL REFERENCES "{{users}}" ("id") ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED,
+"folder_id" integer NOT NULL REFERENCES "{{folders}}" ("id") ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED,
+"virtual_path" text NOT NULL, "quota_size" bigint NOT NULL, "quota_files" integer NOT NULL,
+"sort_order" integer NOT NULL, "exposed_subpaths" text NULL, "subpath" text DEFAULT '' NOT NULL,
+CONSTRAINT "{{prefix}}unique_user_folder_mapping" UNIQUE ("user_id", "folder_id", "subpath"));
+INSERT INTO "{{users_folders_mapping}}_new" ("id", "user_id", "folder_id", "virtual_path", "quota_size",
+"quota_files", "sort_order", "exposed_subpaths", "subpath")
+SELECT "id", "user_id", "folder_id", "virtual_path", "quota_size", "quota_files", "sort_order",
+"exposed_subpaths", "subpath" FROM "{{users_folders_mapping}}";
+DROP TABLE "{{users_folders_mapping}}";
+ALTER TABLE "{{users_folders_mapping}}_new" RENAME TO "{{users_folders_mapping}}";
+CREATE INDEX "{{prefix}}users_folders_mapping_folder_id_idx" ON "{{users_folders_mapping}}" ("folder_id");
+CREATE INDEX "{{prefix}}users_folders_mapping_user_id_idx" ON "{{users_folders_mapping}}" ("user_id");
+CREATE INDEX "{{prefix}}users_folders_mapping_sort_order_idx" ON "{{users_folders_mapping}}" ("sort_order");
+CREATE TABLE "{{groups_folders_mapping}}_new" ("id" integer NOT NULL PRIMARY KEY,
+"folder_id" integer NOT NULL REFERENCES "{{folders}}" ("id") ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED,
+"group_id" integer NOT NULL REFERENCES "{{groups}}" ("id") ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED,
+"virtual_path" text NOT NULL, "quota_size" bigint NOT NULL, "quota_files" integer NOT NULL,
+"sort_order" integer NOT NULL, "exposed_subpaths" text NULL, "subpath" text DEFAULT '' NOT NULL,
+CONSTRAINT "{{prefix}}unique_group_folder_mapping" UNIQUE ("group_id", "folder_id", "subpath"));
+INSERT INTO "{{groups_folders_mapping}}_new" ("id", "folder_id", "group_id", "virtual_path", "quota_size",
+"quota_files", "sort_order", "exposed_subpaths", "subpath")
+SELECT "id", "folder_id", "group_id", "virtual_path", "quota_size", "quota_files", "sort_order",
+"exposed_subpaths", "subpath" FROM "{{groups_folders_mapping}}";
+DROP TABLE "{{groups_folders_mapping}}";
+ALTER TABLE "{{groups_folders_mapping}}_new" RENAME TO "{{groups_folders_mapping}}";
+CREATE INDEX "{{prefix}}groups_folders_mapping_folder_id_idx" ON "{{groups_folders_mapping}}" ("folder_id");
+CREATE INDEX "{{prefix}}groups_folders_mapping_group_id_idx" ON "{{groups_folders_mapping}}" ("group_id");
+CREATE INDEX "{{prefix}}groups_folders_mapping_sort_order_idx" ON "{{groups_folders_mapping}}" ("sort_order");
+CREATE TABLE "{{admins_groups_mapping}}_new" ("id" integer NOT NULL PRIMARY KEY,
+"admin_id" integer NOT NULL REFERENCES "{{admins}}" ("id") ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED,
+"group_id" integer NOT NULL REFERENCES "{{groups}}" ("id") ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED,
+"options" text NOT NULL, "sort_order" integer NOT NULL,
+CONSTRAINT "{{prefix}}unique_admin_group_mapping" UNIQUE ("admin_id", "group_id"));
+INSERT INTO "{{admins_groups_mapping}}_new" ("id", "admin_id", "group_id", "options", "sort_order")
+SELECT "id", "admin_id", "group_id", "options", "sort_order" FROM "{{admins_groups_mapping}}";
+DROP TABLE "{{admins_groups_mapping}}";
+ALTER TABLE "{{admins_groups_mapping}}_new" RENAME TO "{{admins_groups_mapping}}";
+CREATE INDEX "{{prefix}}admins_groups_mapping_admin_id_idx" ON "{{admins_groups_mapping}}" ("admin_id");
+CREATE INDEX "{{prefix}}admins_groups_mapping_group_id_idx" ON "{{admins_groups_mapping}}" ("group_id");
+CREATE INDEX "{{prefix}}admins_groups_mapping_sort_order_idx" ON "{{admins_groups_mapping}}" ("sort_order");
+CREATE TABLE "{{users_groups_mapping}}_new" ("id" integer NOT NULL PRIMARY KEY,
+"user_id" integer NOT NULL REFERENCES "{{users}}" ("id") ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED,
+"group_id" integer NOT NULL REFERENCES "{{groups}}" ("id") ON DELETE NO ACTION,
+"group_type" integer NOT NULL, "sort_order" integer NOT NULL,
+CONSTRAINT "{{prefix}}unique_user_group_mapping" UNIQUE ("user_id", "group_id"));
+INSERT INTO "{{users_groups_mapping}}_new" ("id", "user_id", "group_id", "group_type", "sort_order")
+SELECT "id", "user_id", "group_id", "group_type", "sort_order" FROM "{{users_groups_mapping}}";
+DROP TABLE "{{users_groups_mapping}}";
+ALTER TABLE "{{users_groups_mapping}}_new" RENAME TO "{{users_groups_mapping}}";
+CREATE INDEX "{{prefix}}users_groups_mapping_group_id_idx" ON "{{users_groups_mapping}}" ("group_id");
+CREATE INDEX "{{prefix}}users_groups_mapping_user_id_idx" ON "{{users_groups_mapping}}" ("user_id");
+CREATE INDEX "{{prefix}}users_groups_mapping_sort_order_idx" ON "{{users_groups_mapping}}" ("sort_order");
+CREATE TABLE "{{users}}_new" ("id" integer NOT NULL PRIMARY KEY, "username" varchar(255) NOT NULL UNIQUE,
+"status" integer NOT NULL, "expiration_date" bigint NOT NULL, "description" varchar(512) NULL, "password" text NULL,
+"public_keys" text NULL, "home_dir" text NOT NULL, "uid" bigint NOT NULL, "gid" bigint NOT NULL,
+"max_sessions" integer NOT NULL, "quota_size" bigint NOT NULL, "quota_files" integer NOT NULL, "permissions" text NOT NULL,
+"used_quota_size" bigint NOT NULL, "used_quota_files" integer NOT NULL, "last_quota_update" bigint NOT NULL,
+"upload_bandwidth" integer NOT NULL, "download_bandwidth" integer NOT NULL, "last_login" bigint NOT NULL,
+"filters" text NULL, "filesystem" text NULL, "additional_info" text NULL, "created_at" bigint NOT NULL,
+"updated_at" bigint NOT NULL, "email" varchar(255) NULL, "upload_data_transfer" integer NOT NULL,
+"download_data_transfer" integer NOT NULL, "total_data_transfer" integer NOT NULL, "used_upload_data_transfer" bigint NOT NULL,
+"used_download_data_transfer" bigint NOT NULL, "deleted_at" bigint NOT NULL, "first_download" bigint NOT NULL,
+"first_upload" bigint NOT NULL, "last_password_change" bigint NOT NULL, "role_id" integer NULL REFERENCES "{{roles}}" ("id") ON DELETE SET NULL);
+INSERT INTO "{{users}}_new" ("id", "username", "status", "expiration_date", "description", "password", "public_keys", "home_dir", "uid", "gid",
+"max_sessions", "quota_size", "quota_files", "permissions", "used_quota_size", "used_quota_files",
+"last_quota_update", "upload_bandwidth", "download_bandwidth", "last_login", "filters", "filesystem",
+"additional_info", "created_at", "updated_at", "email", "upload_data_transfer", "download_data_transfer",
+"total_data_transfer", "used_upload_data_transfer", "used_download_data_transfer", "deleted_at", "first_download",
+"first_upload", "last_password_change", "role_id")
+SELECT "id", "username", "status", "expiration_date", "description", "password", "public_keys", "home_dir", "uid", "gid",
+"max_sessions", "quota_size", "quota_files", "permissions", "used_quota_size", "used_quota_files",
+"last_quota_update", "upload_bandwidth", "download_bandwidth", "last_login", "filters", "filesystem",
+"additional_info", "created_at", "updated_at", "email", "upload_data_transfer", "download_data_transfer",
+"total_data_transfer", "used_upload_data_transfer", "used_download_data_transfer", "deleted_at", "first_download",
+"first_upload", "last_password_change", "role_id" FROM "{{users}}";
+DROP TABLE "{{users}}";
+ALTER TABLE "{{users}}_new" RENAME TO "{{users}}";
+CREATE INDEX "{{prefix}}users_updated_at_idx" ON "{{users}}" ("updated_at");
+CREATE INDEX "{{prefix}}users_deleted_at_idx" ON "{{users}}" ("deleted_at");
+CREATE INDEX "{{prefix}}users_role_id_idx" ON "{{users}}" ("role_id");
 `
 )
 
@@ -216,7 +453,9 @@ func initializeSQLiteProvider(basePath string) error {
 		if !filepath.IsAbs(dbPath) {
 			dbPath = filepath.Join(basePath, dbPath)
 		}
-		connectionString = fmt.Sprintf("file:%s?cache=shared&_foreign_keys=1", dbPath)
+		connectionString = fmt.Sprintf(
+			"file:%s?_foreign_keys=1&_journal_mode=WAL&_busy_timeout=5000",
+			dbPath)
 	} else {
 		connectionString = config.ConnectionString
 	}
@@ -715,13 +954,13 @@ func (p *SQLiteProvider) initializeDatabase() error {
 	if errors.Is(err, sql.ErrNoRows) {
 		return errSchemaVersionEmpty
 	}
-	logger.InfoToConsole("creating initial database schema, version 29")
-	providerLog(logger.LevelInfo, "creating initial database schema, version 29")
+	logger.InfoToConsole("creating initial database schema, version 33")
+	providerLog(logger.LevelInfo, "creating initial database schema, version 33")
 	sql := sqlReplaceAll(sqliteInitialSQL)
-	return sqlCommonExecSQLAndUpdateDBVersion(p.dbHandle, []string{sql}, 29, true)
+	return sqlCommonExecSQLAndUpdateDBVersion(p.dbHandle, []string{sql}, 33, true)
 }
 
-func (p *SQLiteProvider) migrateDatabase() error { //nolint:dupl
+func (p *SQLiteProvider) migrateDatabase() error {
 	dbVersion, err := sqlCommonGetDatabaseVersion(p.dbHandle, true)
 	if err != nil {
 		return err
@@ -731,17 +970,17 @@ func (p *SQLiteProvider) migrateDatabase() error { //nolint:dupl
 	case version == sqlDatabaseVersion:
 		providerLog(logger.LevelDebug, "sql database is up to date, current version: %d", version)
 		return ErrNoInitRequired
-	case version < 29:
+	case version < 33:
 		err = errSchemaVersionTooOld(version)
 		providerLog(logger.LevelError, "%v", err)
 		logger.ErrorToConsole("%v", err)
 		return err
-	case version == 29:
-		return updateSQLiteDatabaseFromV29(p.dbHandle)
-	case version == 30:
-		return updateSQLiteDatabaseFromV30(p.dbHandle)
-	case version == 31:
-		return updateSQLiteDatabaseFromV31(p.dbHandle)
+	case version == 33:
+		return updateSQLiteDatabaseFromV33(p.dbHandle)
+	case version == 34:
+		return updateSQLiteDatabaseFromV34(p.dbHandle)
+	case version == 35:
+		return updateSQLiteDatabaseFromV35(p.dbHandle)
 	default:
 		if version > sqlDatabaseVersion {
 			providerLog(logger.LevelError, "database schema version %d is newer than the supported one: %d", version,
@@ -764,12 +1003,12 @@ func (p *SQLiteProvider) revertDatabase(targetVersion int) error {
 	}
 
 	switch dbVersion.Version {
-	case 30:
-		return downgradeSQLiteDatabaseFromV30(p.dbHandle)
-	case 31:
-		return downgradeSQLiteDatabaseFromV31(p.dbHandle)
-	case 32:
-		return downgradeSQLiteDatabaseFromV32(p.dbHandle)
+	case 34:
+		return downgradeSQLiteDatabaseFromV34(p.dbHandle)
+	case 35:
+		return downgradeSQLiteDatabaseFromV35(p.dbHandle)
+	case 36:
+		return downgradeSQLiteDatabaseFromV36(p.dbHandle)
 	default:
 		return fmt.Errorf("database schema version not handled: %d", dbVersion.Version)
 	}
@@ -815,82 +1054,195 @@ func executePragmaOptimize(dbHandle *sql.DB) error {
 	return err
 }
 
-func updateSQLiteDatabaseFromV29(dbHandle *sql.DB) error {
-	if err := updateSQLiteDatabaseFrom29To30(dbHandle); err != nil {
+func updateSQLiteDatabaseFromV33(dbHandle *sql.DB) error {
+	if err := updateSQLiteDatabaseFrom33To34(dbHandle); err != nil {
 		return err
 	}
-	return updateSQLiteDatabaseFromV30(dbHandle)
+	return updateSQLiteDatabaseFromV34(dbHandle)
 }
 
-func updateSQLiteDatabaseFromV30(dbHandle *sql.DB) error {
-	if err := updateSQLiteDatabaseFrom30To31(dbHandle); err != nil {
+func updateSQLiteDatabaseFromV34(dbHandle *sql.DB) error {
+	if err := updateSQLiteDatabaseFrom34To35(dbHandle); err != nil {
 		return err
 	}
-	return updateSQLiteDatabaseFromV31(dbHandle)
+	return updateSQLiteDatabaseFromV35(dbHandle)
 }
 
-func updateSQLiteDatabaseFromV31(dbHandle *sql.DB) error {
-	return updateSQLDatabaseFrom31To32(dbHandle)
+func updateSQLiteDatabaseFromV35(dbHandle *sql.DB) error {
+	return updateSQLiteDatabaseFrom35To36(dbHandle)
 }
 
-func downgradeSQLiteDatabaseFromV30(dbHandle *sql.DB) error {
-	return downgradeSQLiteDatabaseFrom30To29(dbHandle)
+func downgradeSQLiteDatabaseFromV34(dbHandle *sql.DB) error {
+	return downgradeSQLiteDatabaseFrom34To33(dbHandle)
 }
 
-func downgradeSQLiteDatabaseFromV31(dbHandle *sql.DB) error {
-	if err := downgradeSQLiteDatabaseFrom31To30(dbHandle); err != nil {
+func downgradeSQLiteDatabaseFromV35(dbHandle *sql.DB) error {
+	if err := downgradeSQLiteDatabaseFrom35To34(dbHandle); err != nil {
 		return err
 	}
-	return downgradeSQLiteDatabaseFromV30(dbHandle)
+	return downgradeSQLiteDatabaseFromV34(dbHandle)
 }
 
-func downgradeSQLiteDatabaseFromV32(dbHandle *sql.DB) error {
-	if err := downgradeSQLDatabaseFrom32To31(dbHandle); err != nil {
+func downgradeSQLiteDatabaseFromV36(dbHandle *sql.DB) error {
+	if err := downgradeSQLiteDatabaseFrom36To35(dbHandle); err != nil {
 		return err
 	}
-	return downgradeSQLiteDatabaseFromV31(dbHandle)
+	return downgradeSQLiteDatabaseFromV35(dbHandle)
 }
 
-func updateSQLiteDatabaseFrom29To30(dbHandle *sql.DB) error {
-	logger.InfoToConsole("updating database schema version: 29 -> 30")
-	providerLog(logger.LevelInfo, "updating database schema version: 29 -> 30")
+func updateSQLiteDatabaseFrom33To34(dbHandle *sql.DB) error {
+	logger.InfoToConsole("updating database schema version: 33 -> 34")
+	providerLog(logger.LevelInfo, "updating database schema version: 33 -> 34")
 
-	sql := strings.ReplaceAll(sqliteV30SQL, "{{shares}}", sqlTableShares)
-	return sqlCommonExecSQLAndUpdateDBVersion(dbHandle, []string{sql}, 30, true)
+	sql := strings.ReplaceAll(sqliteV34SQL, "{{prefix}}", config.SQLTablesPrefix)
+	sql = strings.ReplaceAll(sql, "{{shares}}", sqlTableShares)
+	sql = strings.ReplaceAll(sql, "{{shares_groups_mapping}}", sqlTableSharesGroupsMapping)
+	sql = strings.ReplaceAll(sql, "{{groups}}", sqlTableGroups)
+	return sqlCommonExecSQLAndUpdateDBVersion(dbHandle, []string{sql}, 34, true)
 }
 
-func downgradeSQLiteDatabaseFrom30To29(dbHandle *sql.DB) error {
-	logger.InfoToConsole("downgrading database schema version: 30 -> 29")
-	providerLog(logger.LevelInfo, "downgrading database schema version: 30 -> 29")
+func downgradeSQLiteDatabaseFrom34To33(dbHandle *sql.DB) error {
+	logger.InfoToConsole("downgrading database schema version: 34 -> 33")
+	providerLog(logger.LevelInfo, "downgrading database schema version: 34 -> 33")
 
-	sql := strings.ReplaceAll(sqliteV30DownSQL, "{{shares}}", sqlTableShares)
-	return sqlCommonExecSQLAndUpdateDBVersion(dbHandle, []string{sql}, 29, false)
+	sql := strings.ReplaceAll(sqliteV34DownSQL, "{{shares_groups_mapping}}", sqlTableSharesGroupsMapping)
+	return sqlCommonExecSQLAndUpdateDBVersion(dbHandle, []string{sql}, 33, false)
 }
 
-func updateSQLiteDatabaseFrom30To31(dbHandle *sql.DB) error {
-	logger.InfoToConsole("updating database schema version: 30 -> 31")
-	providerLog(logger.LevelInfo, "updating database schema version: 30 -> 31")
+func updateSQLiteDatabaseFrom34To35(dbHandle *sql.DB) error {
+	logger.InfoToConsole("updating database schema version: 34 -> 35")
+	providerLog(logger.LevelInfo, "updating database schema version: 34 -> 35")
 
-	sql := strings.ReplaceAll(sqliteV31SQL, "{{shared_sessions}}", sqlTableSharedSessions)
-	sql = strings.ReplaceAll(sql, "{{prefix}}", config.SQLTablesPrefix)
-	return sqlCommonExecSQLAndUpdateDBVersion(dbHandle, []string{sql}, 31, true)
+	sql := strings.ReplaceAll(sqliteV35SQL, "{{prefix}}", config.SQLTablesPrefix)
+	sql = strings.ReplaceAll(sql, "{{users_folders_mapping}}", sqlTableUsersFoldersMapping)
+	sql = strings.ReplaceAll(sql, "{{groups_folders_mapping}}", sqlTableGroupsFoldersMapping)
+	sql = strings.ReplaceAll(sql, "{{users}}", sqlTableUsers)
+	sql = strings.ReplaceAll(sql, "{{groups}}", sqlTableGroups)
+	sql = strings.ReplaceAll(sql, "{{folders}}", sqlTableFolders)
+	return sqlCommonExecSQLAndUpdateDBVersion(dbHandle, []string{sql}, 35, true)
 }
 
-func downgradeSQLiteDatabaseFrom31To30(dbHandle *sql.DB) error {
-	logger.InfoToConsole("downgrading database schema version: 31 -> 30")
-	providerLog(logger.LevelInfo, "downgrading database schema version: 31 -> 30")
+func downgradeSQLiteDatabaseFrom35To34(dbHandle *sql.DB) error {
+	logger.InfoToConsole("downgrading database schema version: 35 -> 34")
+	providerLog(logger.LevelInfo, "downgrading database schema version: 35 -> 34")
 
-	sql := strings.ReplaceAll(sqliteV31DownSQL, "{{shared_sessions}}", sqlTableSharedSessions)
-	sql = strings.ReplaceAll(sql, "{{prefix}}", config.SQLTablesPrefix)
-	return sqlCommonExecSQLAndUpdateDBVersion(dbHandle, []string{sql}, 30, false)
+	sql := strings.ReplaceAll(sqliteV35DownSQL, "{{prefix}}", config.SQLTablesPrefix)
+	sql = strings.ReplaceAll(sql, "{{users_folders_mapping}}", sqlTableUsersFoldersMapping)
+	sql = strings.ReplaceAll(sql, "{{groups_folders_mapping}}", sqlTableGroupsFoldersMapping)
+	sql = strings.ReplaceAll(sql, "{{users}}", sqlTableUsers)
+	sql = strings.ReplaceAll(sql, "{{groups}}", sqlTableGroups)
+	sql = strings.ReplaceAll(sql, "{{folders}}", sqlTableFolders)
+	return sqlCommonExecSQLAndUpdateDBVersion(dbHandle, []string{sql}, 34, false)
 }
 
-/*func setPragmaFK(dbHandle *sql.DB, value string) error {
+func updateSQLiteDatabaseFrom35To36(dbHandle *sql.DB) error {
+	logger.InfoToConsole("updating database schema version: 35 -> 36")
+	providerLog(logger.LevelInfo, "updating database schema version: 35 -> 36")
+
+	sql := sqlReplaceAll(sqliteV36SQL)
+	return sqliteExecMigrationWithoutFK(dbHandle, []string{sql}, 36, true)
+}
+
+func downgradeSQLiteDatabaseFrom36To35(dbHandle *sql.DB) error {
+	logger.InfoToConsole("downgrading database schema version: 36 -> 35")
+	providerLog(logger.LevelInfo, "downgrading database schema version: 36 -> 35")
+
+	sql := sqlReplaceAll(sqliteV36DownSQL)
+	return sqliteExecMigrationWithoutFK(dbHandle, []string{sql}, 35, false)
+}
+
+// setPragmaFK enables or disables foreign key enforcement on the given
+// connection and verifies that the new value is in effect. SQLite ignores the
+// pragma inside a transaction, so it must be set before the transaction starts.
+func setPragmaFK(ctx context.Context, conn *sql.Conn, value string) error {
+	if _, err := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA foreign_keys=%v;", value)); err != nil {
+		return fmt.Errorf("unable to set foreign_keys pragma to %q: %w", value, err)
+	}
+	var enabled int
+	if err := conn.QueryRowContext(ctx, "PRAGMA foreign_keys;").Scan(&enabled); err != nil {
+		return fmt.Errorf("unable to read foreign_keys pragma: %w", err)
+	}
+	if (value == "ON") != (enabled == 1) {
+		return fmt.Errorf("foreign_keys pragma is %d after setting it to %q", enabled, value)
+	}
+	return nil
+}
+
+// sqliteCheckForeignKeys returns an error if the database contains rows that
+// violate a foreign key constraint.
+func sqliteCheckForeignKeys(ctx context.Context, tx *sql.Tx) error {
+	rows, err := tx.QueryContext(ctx, "PRAGMA foreign_key_check;")
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	var tables []string
+	for rows.Next() {
+		var table, parent sql.NullString
+		var rowID, fkID sql.NullInt64
+		if err := rows.Scan(&table, &rowID, &parent, &fkID); err != nil {
+			return err
+		}
+		if !slices.Contains(tables, table.String) {
+			tables = append(tables, table.String)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if len(tables) > 0 {
+		return fmt.Errorf("foreign key violations found in the following tables: %v", tables)
+	}
+	return nil
+}
+
+// sqliteExecMigrationWithoutFK executes a migration that rebuilds tables to
+// change their foreign keys. Enforcement is disabled on the migration
+// connection so that dropping a table referenced by others does not delete
+// their rows, and referential integrity is verified before committing.
+func sqliteExecMigrationWithoutFK(dbHandle *sql.DB, sqlQueries []string, newVersion int, isUp bool) (err error) {
 	ctx, cancel := context.WithTimeout(context.Background(), longSQLQueryTimeout)
 	defer cancel()
 
-	sql := fmt.Sprintf("PRAGMA foreign_keys=%v;", value)
+	conn, err := dbHandle.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("unable to get connection from pool: %w", err)
+	}
+	defer conn.Close()
 
-	_, err := dbHandle.ExecContext(ctx, sql)
-	return err
-}*/
+	if err = setPragmaFK(ctx, conn, "OFF"); err != nil {
+		return err
+	}
+	defer func() {
+		// the connection goes back to the pool, returning it with foreign keys
+		// disabled would silently accept inconsistent data
+		if pragmaErr := setPragmaFK(ctx, conn, "ON"); pragmaErr != nil && err == nil {
+			err = pragmaErr
+		}
+	}()
+
+	currentVersion, err := sqlCommonGetDatabaseVersion(conn, false)
+	if err == nil {
+		if (isUp && currentVersion.Version >= newVersion) || (!isUp && currentVersion.Version <= newVersion) {
+			providerLog(logger.LevelInfo, "current schema version: %v, requested: %v, did you execute simultaneous migrations?",
+				currentVersion.Version, newVersion)
+			return nil
+		}
+	}
+
+	return sqlCommonExecuteTxOnConn(ctx, conn, func(tx *sql.Tx) error {
+		for _, q := range sqlQueries {
+			if strings.TrimSpace(q) == "" {
+				continue
+			}
+			if _, err := tx.ExecContext(ctx, q); err != nil {
+				return err
+			}
+		}
+		if err := sqliteCheckForeignKeys(ctx, tx); err != nil {
+			return err
+		}
+		return sqlCommonUpdateDatabaseVersion(ctx, tx, newVersion)
+	})
+}

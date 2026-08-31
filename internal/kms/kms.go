@@ -18,6 +18,8 @@ package kms
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
+	"slices"
 	"strings"
 	"sync"
 
@@ -106,15 +108,11 @@ func NewPlainSecret(payload string) *Secret {
 
 // Initialize configures the KMS support
 func (c *Configuration) Initialize() error {
-	if c.Secrets.MasterKeyPath != "" {
-		mKey, err := util.ReadConfigFromFile(c.Secrets.MasterKeyPath, "")
-		if err != nil {
-			return err
-		}
-		c.Secrets.masterKey = mKey
-	} else if c.Secrets.MasterKeyString != "" {
-		c.Secrets.masterKey = c.Secrets.MasterKeyString
+	masterKey, err := util.ResolveConfigValue(c.Secrets.MasterKeyString, c.Secrets.MasterKeyPath, "")
+	if err != nil {
+		return err
 	}
+	c.Secrets.masterKey = masterKey
 	config = *c
 	if config.Secrets.URL == "" {
 		config.Secrets.URL = sdkkms.SchemeLocal + "://"
@@ -146,6 +144,17 @@ func (c *Configuration) getSecretProvider(base BaseSecret) SecretProvider {
 	}
 	logger.Warn(logSender, "", "no secret provider registered for URL %v, fallback to local provider", c.Secrets.URL)
 	return NewLocalSecret(base, c.Secrets.URL, c.Secrets.masterKey)
+}
+
+// CheckProviderAvailable returns an error when no secret provider is registered
+// for the configured secrets URL.
+func CheckProviderAvailable() error {
+	for k := range secretProviders {
+		if strings.HasPrefix(config.Secrets.URL, k) {
+			return nil
+		}
+	}
+	return fmt.Errorf("no KMS secret provider is registered for the configured URL %q", config.Secrets.URL)
 }
 
 // Secret defines the struct used to store confidential data
@@ -423,10 +432,5 @@ func (s *Secret) TryDecrypt() error {
 }
 
 func isSecretStatusValid(status string) bool {
-	for idx := range validSecretStatuses {
-		if validSecretStatuses[idx] == status {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(validSecretStatuses, status)
 }

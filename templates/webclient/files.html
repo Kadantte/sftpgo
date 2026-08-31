@@ -1,9 +1,9 @@
 <!--
 Copyright (C) 2023 Nicola Murino
 
-This WebUI uses the KeenThemes Mega Bundle, a proprietary theme:
+This WebUI uses the KeenThemes Bootstrap Templates:
 
-https://keenthemes.com/products/templates-mega-bundle
+https://keenthemes.com/bootstrap-templates
 
 KeenThemes HTML/CSS/JS components are allowed for use only within the
 SFTPGo product and restricted to be used in a resealable HTML template
@@ -208,18 +208,12 @@ explicit grant from the SFTPGo Team (support@sftpgo.com).
 
 {{- define "extra_css"}}
 <link href="{{.StaticURL}}/assets/plugins/custom/datatables/datatables.bundle.css" rel="stylesheet" type="text/css"/>
-<link href="{{.StaticURL}}/vendor/glightbox/glightbox.min.css" rel="stylesheet" type="text/css"/>
-<style {{- if .CSPNonce}} nonce="{{.CSPNonce}}"{{- end}}>
-    .gslide-description-bg {
-		background: var(--bs-app-bg-color) !important;
-        opacity: 0.9;
-	}
-</style>
+<link href="{{.StaticURL}}/vendor/imageviewer/imageviewer.css" rel="stylesheet" type="text/css"/>
 {{- end}}
 
 {{- define "extra_js"}}
 <script {{- if .CSPNonce}} nonce="{{.CSPNonce}}"{{- end}} src="{{.StaticURL}}/assets/plugins/custom/datatables/datatables.bundle.js"></script>
-<script {{- if .CSPNonce}} nonce="{{.CSPNonce}}"{{- end}} src="{{.StaticURL}}/vendor/glightbox/glightbox.min.js"></script>
+<script {{- if .CSPNonce}} nonce="{{.CSPNonce}}"{{- end}} src="{{.StaticURL}}/vendor/imageviewer/imageviewer.js"></script>
 <script {{- if .CSPNonce}} nonce="{{.CSPNonce}}"{{- end}} src="{{.StaticURL}}/vendor/pdfobject/pdfobject.min.js"></script>
 <script type="text/javascript" {{- if .CSPNonce}} nonce="{{.CSPNonce}}"{{- end}}>
     //{{- $move_copy_msg := ""}}
@@ -244,7 +238,7 @@ explicit grant from the SFTPGo Team (support@sftpgo.com).
                               `;
 
     //{{- if not .ShareUploadBaseURL}}
-    const supportedEditExtensions = ["csv", "bat", "dyalog", "apl", "asc", "pgp", "sig", "asn", "asn1", "b", "bf",
+    const supportedEditExtensions = ["csv", "bat", "dyalog", "apl", "asc", "sig", "asn", "asn1", "b", "bf",
             "c", "h", "ino", "cpp", "c++", "cc", "cxx", "hpp", "h++", "hh", "hxx", "cob", "cpy", "cbl", "cs", "clj",
             "cljc", "cljx", "cljs", "gss", "cmake", "cmake.in", "coffee", "cl", "lisp", "el", "cyp", "cypher",
             "pyx", "pxd", "pxi", "cr", "css", "cql", "d", "dart", "diff", "patch", "dtd", "dylan", "dyl", "intr",
@@ -365,7 +359,13 @@ explicit grant from the SFTPGo Team (support@sftpgo.com).
                 stateSave: false,
                 columns: [
                     {
-                        data: "meta"
+                        data: "meta",
+                        render: function (data, type, row) {
+                            if (type === 'display') {
+                                return "";
+                            }
+                            return data;
+                        }
                     },
                     {
                         data: "name",
@@ -504,6 +504,7 @@ explicit grant from the SFTPGo Team (support@sftpgo.com).
                         switch (error.response.status) {
                             case 200:
                                 errorMessage = "general.expired_session";
+                                break;
                             case 403:
                                 errorMessage = "fs.create_dir.err_403";
                                 break;
@@ -557,7 +558,6 @@ explicit grant from the SFTPGo Team (support@sftpgo.com).
     var KTDatatablesServerSide = function () {
         // Shared variables
         var dt;
-        var lightbox;
 
 
         // Private functions
@@ -677,6 +677,7 @@ explicit grant from the SFTPGo Team (support@sftpgo.com).
                     },
                     {
                         data: "edit_url",
+                        defaultContent: '',
                         className: 'text-end',
                         render: function (data, type, row) {
                             if (type === 'display') {
@@ -692,16 +693,16 @@ explicit grant from the SFTPGo Team (support@sftpgo.com).
                                         case "webp":
                                         case "bmp":
                                         case "svg":
-                                            let desc = escapeHTML(filename).replace(/"/g, '&quot;');
+                                            let desc = filename.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
                                             previewDiv = `<div class="ms-2" data-kt-filemanger-table="view_item">
-												    <a href="${row['url']}" data-gallery="gallery" data-glightbox="description: &lt;span class=&quot;fs-5 fw-bold&quot;&gt;${desc}&lt;/span&gt;" class="btn btn-sm btn-icon btn-light btn-active-light-primary glightbox">
-													    <i class="ki-duotone ki-eye fs-6 m-0">
-														    <span class="path1"></span>
-														    <span class="path2"></span>
+                                                    <a href="${row['url']}" data-iv-name="${desc}" class="btn btn-sm btn-icon btn-light btn-active-light-primary iv-gallery-item">
+                                                        <i class="ki-duotone ki-eye fs-6 m-0">
+                                                            <span class="path1"></span>
+                                                            <span class="path2"></span>
                                                             <span class="path3"></span>
-													    </i>
-												    </a>
-											    </div>`;
+                                                        </i>
+                                                    </a>
+                                                </div>`;
                                             break;
                                         case "mp4":
                                         case "mov":
@@ -831,7 +832,14 @@ explicit grant from the SFTPGo Team (support@sftpgo.com).
                     loadingRecords: "",
                     processing: $.t('datatable.processing'),
                     zeroRecords: "",
-                    emptyTable: $.t('fs.no_files_folders')
+                    emptyTable: $.t('fs.no_files_folders'),
+                    select: {
+                        rows: {
+                            _: $.t('general.selected_with_placeholder'),
+                            0: '',
+                            1: $.t('general.selected_items', { count: 1})
+                        }
+                    }
                 },
                 orderFixed: [1, 'asc'],
                 order: [2, 'asc'],
@@ -855,7 +863,6 @@ explicit grant from the SFTPGo Team (support@sftpgo.com).
                 $('#upload_files_empty_container').addClass("d-none");
                 $('#file_manager_list_container').removeClass("d-none");
                 //{{- end}}
-                lightbox.reload();
                 KTMenu.createInstances();
 
                 let targets = document.querySelectorAll('#file_manager_list_body tr');
@@ -997,24 +1004,24 @@ explicit grant from the SFTPGo Team (support@sftpgo.com).
         }
 
         var initLightbox = function() {
-            lightbox = GLightbox({
-                    slideHTML: `<div class="gslide">
-                                    <div class="gslide-inner-content">
-                                        <div class="ginner-container">
-                                            <div class="gslide-media">
-                                            </div>
-                                            <div class="gslide-description gslide-description-bg">
-                                                <div class="gdesc-inner">
-                                                    <h4 class="gslide-title"></h4>
-                                                    <div class="gslide-desc"></div>
-                                                </div>
-                                            </div>
-                                        </div>
-                                    </div>
-                                </div>`,
-                    preload: false,
-                    closeOnOutsideClick: false
+            document.getElementById('file_manager_list_body').addEventListener('click', function(e) {
+                var link = e.target.closest('a.iv-gallery-item');
+                if (!link) return;
+                e.preventDefault();
+
+                var links = document.querySelectorAll('#file_manager_list_body a.iv-gallery-item');
+                var items = [];
+                var clickedIndex = 0;
+                links.forEach(function(el, i) {
+                    items.push({
+                        src: el.getAttribute('href'),
+                        name: el.dataset.ivName || ''
+                    });
+                    if (el === link) clickedIndex = i;
                 });
+
+                ImageViewer.open(items, clickedIndex);
+            });
         }
 
         var handleSearchDatatable = function () {
@@ -1062,10 +1069,23 @@ explicit grant from the SFTPGo Team (support@sftpgo.com).
                     let currentDir = '{{.CurrentDir}}';
                     let ts = new Date().getTime().toString();
                     let files = JSON.stringify(filesArray);
-                    $(`<form method="post" action="${downloadURL}?path=${currentDir}&_=${ts}" target="_blank" rel="noopener noreferrer">
-                        <input type="hidden" name="_form_token" value="${token}">
-                        <textarea name="files" hidden>${files}</textarea>
-                       </form>`).appendTo('body').submit().remove();
+                    const form = document.createElement('form');
+                    form.method = 'post';
+                    form.action = `${downloadURL}?path=${currentDir}&_=${ts}`;
+                    form.target = '_blank';
+                    form.setAttribute('rel', 'noopener noreferrer');
+                    const tokenInput = document.createElement('input');
+                    tokenInput.type = 'hidden';
+                    tokenInput.name = '_form_token';
+                    tokenInput.value = token;
+                    const filesArea = document.createElement('textarea');
+                    filesArea.name = 'files';
+                    filesArea.hidden = true;
+                    filesArea.value = files;
+                    form.append(tokenInput, filesArea);
+                    document.body.appendChild(form);
+                    form.submit();
+                    form.remove();
                 });
             }
 
@@ -1958,6 +1978,7 @@ explicit grant from the SFTPGo Team (support@sftpgo.com).
                     switch (error.response.status) {
                         case 200:
                             errorMessage = "general.expired_session";
+                            break;
                         case 403:
                             errorMessage = "fs.create_dir.err_403";
                             break;
@@ -2177,8 +2198,8 @@ explicit grant from the SFTPGo Team (support@sftpgo.com).
                 axios.post(path, {
                     files: files
                 }, {
+                    timeout: 15000,
                     headers: {
-                        timeout: 15000,
                         'X-CSRF-TOKEN': '{{.CSRFToken}}'
                     },
                     validateStatus: function (status) {

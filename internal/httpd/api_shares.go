@@ -26,20 +26,20 @@ import (
 	"strings"
 	"time"
 
-	"github.com/go-chi/jwtauth/v5"
 	"github.com/go-chi/render"
 	"github.com/rs/xid"
 	"github.com/sftpgo/sdk"
 
 	"github.com/drakkan/sftpgo/v2/internal/common"
 	"github.com/drakkan/sftpgo/v2/internal/dataprovider"
+	"github.com/drakkan/sftpgo/v2/internal/jwt"
 	"github.com/drakkan/sftpgo/v2/internal/logger"
 	"github.com/drakkan/sftpgo/v2/internal/util"
 )
 
 func getShares(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestSize)
-	claims, err := getTokenClaims(r)
+	claims, err := jwt.FromContext(r.Context())
 	if err != nil || claims.Username == "" {
 		sendAPIResponse(w, r, err, "Invalid token claims", http.StatusBadRequest)
 		return
@@ -59,7 +59,7 @@ func getShares(w http.ResponseWriter, r *http.Request) {
 
 func getShareByID(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestSize)
-	claims, err := getTokenClaims(r)
+	claims, err := jwt.FromContext(r.Context())
 	if err != nil || claims.Username == "" {
 		sendAPIResponse(w, r, err, "Invalid token claims", http.StatusBadRequest)
 		return
@@ -77,7 +77,7 @@ func getShareByID(w http.ResponseWriter, r *http.Request) {
 
 func addShare(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestSize)
-	claims, err := getTokenClaims(r)
+	claims, err := jwt.FromContext(r.Context())
 	if err != nil || claims.Username == "" {
 		sendAPIResponse(w, r, err, "Invalid token claims", http.StatusBadRequest)
 		return
@@ -126,7 +126,7 @@ func addShare(w http.ResponseWriter, r *http.Request) {
 
 func updateShare(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestSize)
-	claims, err := getTokenClaims(r)
+	claims, err := jwt.FromContext(r.Context())
 	if err != nil || claims.Username == "" {
 		sendAPIResponse(w, r, err, "Invalid token claims", http.StatusBadRequest)
 		return
@@ -177,7 +177,7 @@ func updateShare(w http.ResponseWriter, r *http.Request) {
 func deleteShare(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestSize)
 	shareID := getURLParam(r, "id")
-	claims, err := getTokenClaims(r)
+	claims, err := jwt.FromContext(r.Context())
 	if err != nil || claims.Username == "" {
 		sendAPIResponse(w, r, err, "Invalid token claims", http.StatusBadRequest)
 		return
@@ -198,6 +198,8 @@ func (s *httpdServer) readBrowsableShareContents(w http.ResponseWriter, r *http.
 	if err != nil {
 		return
 	}
+	defer connection.CloseFS()
+
 	if err := validateBrowsableShare(share, connection); err != nil {
 		sendAPIResponse(w, r, err, "", getRespStatus(err))
 		return
@@ -229,6 +231,8 @@ func (s *httpdServer) downloadBrowsableSharedFile(w http.ResponseWriter, r *http
 	if err != nil {
 		return
 	}
+	defer connection.CloseFS()
+
 	if err := validateBrowsableShare(share, connection); err != nil {
 		sendAPIResponse(w, r, err, "", getRespStatus(err))
 		return
@@ -256,10 +260,12 @@ func (s *httpdServer) downloadBrowsableSharedFile(w http.ResponseWriter, r *http
 		return
 	}
 
-	inline := r.URL.Query().Get("inline") != ""
-	dataprovider.UpdateShareLastUse(&share, 1) //nolint:errcheck
-	if status, err := downloadFile(w, r, connection, name, info, inline, &share); err != nil {
-		dataprovider.UpdateShareLastUse(&share, -1) //nolint:errcheck
+	if err := dataprovider.UpdateShareLastUse(&share, 1); err != nil {
+		sendAPIResponse(w, r, err, "", getRespStatus(err))
+		return
+	}
+	if status, err := downloadFile(w, r, connection, name, info, false, &share); err != nil {
+		_ = dataprovider.UpdateShareLastUse(&share, -1)
 		resp := apiResponse{
 			Error:   err.Error(),
 			Message: http.StatusText(status),
@@ -279,6 +285,7 @@ func (s *httpdServer) downloadFromShare(w http.ResponseWriter, r *http.Request) 
 	if err != nil {
 		return
 	}
+	defer connection.CloseFS()
 
 	if err = common.Connections.Add(connection); err != nil {
 		sendAPIResponse(w, r, err, "Unable to add connection", http.StatusTooManyRequests)
@@ -299,27 +306,32 @@ func (s *httpdServer) downloadFromShare(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 
-	dataprovider.UpdateShareLastUse(&share, 1) //nolint:errcheck
+	if err := dataprovider.UpdateShareLastUse(&share, 1); err != nil {
+		sendAPIResponse(w, r, err, "", getRespStatus(err))
+		return
+	}
 	if compress {
 		transferQuota := connection.GetTransferQuota()
 		if !transferQuota.HasDownloadSpace() {
 			err = connection.GetReadQuotaExceededError()
 			connection.Log(logger.LevelInfo, "denying share read due to quota limits")
 			sendAPIResponse(w, r, err, "", getMappedStatusCode(err))
-			dataprovider.UpdateShareLastUse(&share, -1) //nolint:errcheck
+			_ = dataprovider.UpdateShareLastUse(&share, -1)
 			return
 		}
 		baseDir := "/"
+		files := share.Paths
 		if info != nil && info.IsDir() {
+			// zip entry names are relative to the shared directory
 			baseDir = share.Paths[0]
-			share.Paths[0] = "/"
+			files = []string{"/"}
 		}
 		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"share-%v.zip\"", share.Name))
-		renderCompressedFiles(w, connection, baseDir, share.Paths, &share)
+		renderCompressedFiles(w, connection, baseDir, files, &share)
 		return
 	}
 	if status, err := downloadFile(w, r, connection, share.Paths[0], info, false, &share); err != nil {
-		dataprovider.UpdateShareLastUse(&share, -1) //nolint:errcheck
+		_ = dataprovider.UpdateShareLastUse(&share, -1)
 		resp := apiResponse{
 			Error:   err.Error(),
 			Message: http.StatusText(status),
@@ -342,6 +354,8 @@ func (s *httpdServer) uploadFileToShare(w http.ResponseWriter, r *http.Request) 
 	if err != nil {
 		return
 	}
+	defer connection.CloseFS()
+
 	filePath := util.CleanPath(path.Join(share.Paths[0], name))
 	expectedPrefix := share.Paths[0]
 	if !strings.HasSuffix(expectedPrefix, "/") {
@@ -351,7 +365,10 @@ func (s *httpdServer) uploadFileToShare(w http.ResponseWriter, r *http.Request) 
 		sendAPIResponse(w, r, err, "Uploading outside the share is not allowed", http.StatusForbidden)
 		return
 	}
-	dataprovider.UpdateShareLastUse(&share, 1) //nolint:errcheck
+	if err := dataprovider.UpdateShareLastUse(&share, 1); err != nil {
+		sendAPIResponse(w, r, err, "", getRespStatus(err))
+		return
+	}
 
 	if err = common.Connections.Add(connection); err != nil {
 		sendAPIResponse(w, r, err, "Unable to add connection", http.StatusTooManyRequests)
@@ -359,7 +376,7 @@ func (s *httpdServer) uploadFileToShare(w http.ResponseWriter, r *http.Request) 
 	}
 	defer common.Connections.Remove(connection.GetID())
 
-	connection.User.CheckFsRoot(connection.ID) //nolint:errcheck
+	_ = connection.User.CheckFsRoot(connection.ID)
 	if getBoolQueryParam(r, "mkdir_parents") {
 		if err = connection.CheckParentDirs(path.Dir(filePath)); err != nil {
 			sendAPIResponse(w, r, err, "Error checking parent directories", getMappedStatusCode(err))
@@ -367,7 +384,7 @@ func (s *httpdServer) uploadFileToShare(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 	if err := doUploadFile(w, r, connection, filePath); err != nil {
-		dataprovider.UpdateShareLastUse(&share, -1) //nolint:errcheck
+		_ = dataprovider.UpdateShareLastUse(&share, -1)
 	}
 }
 
@@ -380,7 +397,9 @@ func (s *httpdServer) uploadFilesToShare(w http.ResponseWriter, r *http.Request)
 	if err != nil {
 		return
 	}
-	if err := common.Connections.IsNewTransferAllowed(connection.User.Username); err != nil {
+	defer connection.CloseFS()
+
+	if err := common.Connections.IsNewTransferAllowed(connection.BaseConnection); err != nil {
 		connection.Log(logger.LevelInfo, "denying file write due to number of transfer limits")
 		sendAPIResponse(w, r, err, "Denying file write due to transfer count limits",
 			http.StatusConflict)
@@ -401,47 +420,45 @@ func (s *httpdServer) uploadFilesToShare(w http.ResponseWriter, r *http.Request)
 	}
 	defer common.Connections.Remove(connection.GetID())
 
-	t := newThrottledReader(r.Body, connection.User.UploadBandwidth, connection)
-	r.Body = t
-	err = r.ParseMultipartForm(maxMultipartMem)
-	if err != nil {
-		connection.RemoveTransfer(t)
+	if err = parseUploadMultipartForm(connection, r); err != nil {
 		sendAPIResponse(w, r, err, "Unable to parse multipart form", http.StatusBadRequest)
 		return
 	}
-	connection.RemoveTransfer(t)
-	defer r.MultipartForm.RemoveAll() //nolint:errcheck
+	defer r.MultipartForm.RemoveAll()
 
 	files := r.MultipartForm.File["filenames"]
 	if len(files) == 0 {
 		sendAPIResponse(w, r, nil, "No files uploaded!", http.StatusBadRequest)
 		return
 	}
-	if share.MaxTokens > 0 {
-		if len(files) > (share.MaxTokens - share.UsedTokens) {
-			sendAPIResponse(w, r, nil, "Allowed usage exceeded", http.StatusBadRequest)
-			return
-		}
+	if share.MaxTokens > 0 && len(files) > (share.MaxTokens-share.UsedTokens) {
+		sendAPIResponse(w, r, nil, "Allowed usage exceeded", http.StatusBadRequest)
+		return
 	}
-	dataprovider.UpdateShareLastUse(&share, len(files)) //nolint:errcheck
+	if err := dataprovider.UpdateShareLastUse(&share, len(files)); err != nil {
+		sendAPIResponse(w, r, err, "", getRespStatus(err))
+		return
+	}
 
-	connection.User.CheckFsRoot(connection.ID) //nolint:errcheck
-	numUploads := doUploadFiles(w, r, connection, share.Paths[0], files)
-	if numUploads != len(files) {
-		dataprovider.UpdateShareLastUse(&share, numUploads-len(files)) //nolint:errcheck
-	}
+	numUploads := 0
+	defer func() {
+		if numUploads != len(files) {
+			_ = dataprovider.UpdateShareLastUse(&share, numUploads-len(files))
+		}
+	}()
+	_ = connection.User.CheckFsRoot(connection.ID)
+	numUploads = doUploadFiles(w, r, connection, share.Paths[0], files)
 }
 
-func (s *httpdServer) getShareClaims(r *http.Request, shareID string) (context.Context, *jwtTokenClaims, error) {
-	token, err := jwtauth.VerifyRequest(s.tokenAuth, r, jwtauth.TokenFromCookie)
+func (s *httpdServer) getShareClaims(r *http.Request, shareID string) (context.Context, *jwt.Claims, error) {
+	token, err := jwt.VerifyRequest(s.tokenAuth, r, jwt.TokenFromCookie)
 	if err != nil || token == nil {
 		return nil, nil, errInvalidToken
 	}
-	tokenString := jwtauth.TokenFromCookie(r)
-	if tokenString == "" || invalidatedJWTTokens.Get(tokenString) {
+	if token.ID == "" || invalidatedJWTTokens.Get(token.ID) {
 		return nil, nil, errInvalidToken
 	}
-	if !slices.Contains(token.Audience(), tokenAudienceWebShare) {
+	if !token.Audience.Contains(tokenAudienceWebShare) {
 		logger.Debug(logSender, "", "invalid token audience for share %q", shareID)
 		return nil, nil, errInvalidToken
 	}
@@ -450,13 +467,12 @@ func (s *httpdServer) getShareClaims(r *http.Request, shareID string) (context.C
 		logger.Debug(logSender, "", "token for share %q is not valid for the ip address %q", shareID, ipAddr)
 		return nil, nil, err
 	}
-	ctx := jwtauth.NewContext(r.Context(), token, nil)
-	claims, err := getTokenClaims(r.WithContext(ctx))
-	if err != nil || claims.Username != shareID {
+	if token.Username != shareID {
 		logger.Debug(logSender, "", "token not valid for share %q", shareID)
 		return nil, nil, errInvalidToken
 	}
-	return ctx, &claims, nil
+	ctx := jwt.NewContext(r.Context(), token, nil)
+	return ctx, token, nil
 }
 
 func (s *httpdServer) checkWebClientShareCredentials(w http.ResponseWriter, r *http.Request, share *dataprovider.Share) error {
@@ -465,9 +481,17 @@ func (s *httpdServer) checkWebClientShareCredentials(w http.ResponseWriter, r *h
 		http.Redirect(w, r, redirectURL, http.StatusFound)
 	}
 
-	if _, _, err := s.getShareClaims(r, share.ShareID); err != nil {
+	_, claims, err := s.getShareClaims(r, share.ShareID)
+	if err != nil {
 		doRedirect()
 		return err
+	}
+	if tokenValidationMode&tokenValidationModeUserSignature != 0 {
+		if share.GetSignature() != claims.Subject {
+			logger.Debug(logSender, "", "the share %q was updated, the login token is no longer valid", share.ShareID)
+			doRedirect()
+			return errInvalidToken
+		}
 	}
 	return nil
 }
@@ -518,7 +542,7 @@ func (s *httpdServer) checkPublicShare(w http.ResponseWriter, r *http.Request, v
 			}
 			match, err := share.CheckCredentials(password)
 			if !match || err != nil {
-				handleDefenderEventLoginFailed(ipAddr, dataprovider.ErrInvalidCredentials) //nolint:errcheck
+				_ = handleDefenderEventLoginFailed(ipAddr, dataprovider.ErrInvalidCredentials)
 				w.Header().Set(common.HTTPAuthenticationHeader, basicRealm)
 				renderError(dataprovider.ErrInvalidCredentials, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
 				return share, nil, dataprovider.ErrInvalidCredentials
@@ -532,11 +556,8 @@ func (s *httpdServer) checkPublicShare(w http.ResponseWriter, r *http.Request, v
 		return share, nil, err
 	}
 	connID := xid.New().String()
-	connection := &Connection{
-		BaseConnection: common.NewBaseConnection(connID, common.ProtocolHTTPShare, util.GetHTTPLocalAddress(r),
-			r.RemoteAddr, user),
-		request: r,
-	}
+	baseConn := common.NewBaseConnection(connID, common.ProtocolHTTPShare, util.GetHTTPLocalAddress(r), r.RemoteAddr, user)
+	connection := newConnection(baseConn, w, r)
 
 	return share, connection, nil
 }
@@ -574,7 +595,6 @@ func validateBrowsableShare(share dataprovider.Share, connection *Connection) er
 	basePath := share.Paths[0]
 	info, err := connection.Stat(basePath, 0)
 	if err != nil {
-		connection.CloseFS() //nolint:errcheck
 		return util.NewI18nError(
 			fmt.Errorf("unable to check the share directory: %w", err),
 			util.I18nErrorShareInvalidPath,

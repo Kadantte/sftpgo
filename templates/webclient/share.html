@@ -1,9 +1,9 @@
 <!--
 Copyright (C) 2023 Nicola Murino
 
-This WebUI uses the KeenThemes Mega Bundle, a proprietary theme:
+This WebUI uses the KeenThemes Bootstrap Templates:
 
-https://keenthemes.com/products/templates-mega-bundle
+https://keenthemes.com/bootstrap-templates
 
 KeenThemes HTML/CSS/JS components are allowed for use only within the
 SFTPGo product and restricted to be used in a resealable HTML template
@@ -184,6 +184,8 @@ explicit grant from the SFTPGo Team (support@sftpgo.com).
 <script {{- if .CSPNonce}} nonce="{{.CSPNonce}}"{{- end}} src="{{.StaticURL}}/assets/plugins/custom/flatpickr/l10n/it.js"></script>
 <script {{- if .CSPNonce}} nonce="{{.CSPNonce}}"{{- end}} src="{{.StaticURL}}/assets/plugins/custom/flatpickr/l10n/de.js"></script>
 <script {{- if .CSPNonce}} nonce="{{.CSPNonce}}"{{- end}} src="{{.StaticURL}}/assets/plugins/custom/flatpickr/l10n/fr.js"></script>
+<script {{- if .CSPNonce}} nonce="{{.CSPNonce}}"{{- end}} src="{{.StaticURL}}/assets/plugins/custom/flatpickr/l10n/zh.js"></script>
+<script {{- if .CSPNonce}} nonce="{{.CSPNonce}}"{{- end}} src="{{.StaticURL}}/assets/plugins/custom/flatpickr/l10n/es.js"></script>
 <script type="text/javascript" {{- if .CSPNonce}} nonce="{{.CSPNonce}}"{{- end}}>
     $(document).on("i18nshow", function(){
             initRepeater('#paths');
@@ -202,7 +204,7 @@ explicit grant from the SFTPGo Team (support@sftpgo.com).
                 },
                 defaultHour: 23,
                 defaultMinute: 59,
-                locale: i18next.resolvedLanguage,
+                locale: flatpickrLocale(),
                 onChange: function(selectedDates, dateStr, instance) {
                     if (selectedDates.length > 0){
                         $('#id_expiration_clear').removeClass("d-none");

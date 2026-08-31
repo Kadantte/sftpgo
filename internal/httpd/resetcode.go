@@ -79,7 +79,12 @@ func (m *memoryResetCodeManager) Get(code string) (*resetCode, error) {
 	if !ok {
 		return nil, util.NewRecordNotFoundError("reset code not found")
 	}
-	return c.(*resetCode), nil
+	rc := c.(*resetCode)
+	if rc.isExpired() {
+		m.resetCodes.Delete(code)
+		return nil, util.NewRecordNotFoundError("reset code expired")
+	}
+	return rc, nil
 }
 
 func (m *memoryResetCodeManager) Delete(code string) error {
@@ -136,5 +141,5 @@ func (m *dbResetCodeManager) Delete(code string) error {
 }
 
 func (m *dbResetCodeManager) Cleanup() {
-	dataprovider.CleanupSharedSessions(dataprovider.SessionTypeResetCode, time.Now()) //nolint:errcheck
+	_ = dataprovider.CleanupSharedSessions(dataprovider.SessionTypeResetCode, time.Now())
 }

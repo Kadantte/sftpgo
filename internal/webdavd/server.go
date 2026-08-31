@@ -55,18 +55,16 @@ func (s *webDavServer) listenAndServe(compressor *middleware.Compressor) error {
 	handler := compressor.Handler(s)
 	httpServer := &http.Server{
 		ReadHeaderTimeout: 30 * time.Second,
-		ReadTimeout:       60 * time.Second,
-		WriteTimeout:      60 * time.Second,
 		IdleTimeout:       60 * time.Second,
 		MaxHeaderBytes:    1 << 16, // 64KB
 		ErrorLog:          log.New(&logger.StdLoggerWrapper{Sender: logSender}, "", 0),
 	}
 	if s.config.Cors.Enabled {
 		c := cors.New(cors.Options{
-			AllowedOrigins:       util.RemoveDuplicates(s.config.Cors.AllowedOrigins, true),
-			AllowedMethods:       util.RemoveDuplicates(s.config.Cors.AllowedMethods, true),
-			AllowedHeaders:       util.RemoveDuplicates(s.config.Cors.AllowedHeaders, true),
-			ExposedHeaders:       util.RemoveDuplicates(s.config.Cors.ExposedHeaders, true),
+			AllowedOrigins:       util.RemoveDuplicates(slices.Clone(s.config.Cors.AllowedOrigins), true),
+			AllowedMethods:       util.RemoveDuplicates(slices.Clone(s.config.Cors.AllowedMethods), true),
+			AllowedHeaders:       util.RemoveDuplicates(slices.Clone(s.config.Cors.AllowedHeaders), true),
+			ExposedHeaders:       util.RemoveDuplicates(slices.Clone(s.config.Cors.ExposedHeaders), true),
 			MaxAge:               s.config.Cors.MaxAge,
 			AllowCredentials:     s.config.Cors.AllowCredentials,
 			OptionsPassthrough:   s.config.Cors.OptionsPassthrough,
@@ -76,14 +74,14 @@ func (s *webDavServer) listenAndServe(compressor *middleware.Compressor) error {
 		handler = c.Handler(handler)
 	}
 	httpServer.Handler = handler
-	if certMgr != nil && s.binding.EnableHTTPS {
-		serviceStatus.Bindings = append(serviceStatus.Bindings, s.binding)
+	if mgr := certMgr.Load(); mgr != nil && s.binding.EnableHTTPS {
+		addServiceStatusBinding(s.binding)
 		certID := common.DefaultTLSKeyPaidID
 		if getConfigPath(s.binding.CertificateFile, "") != "" && getConfigPath(s.binding.CertificateKeyFile, "") != "" {
 			certID = s.binding.GetAddress()
 		}
 		httpServer.TLSConfig = &tls.Config{
-			GetCertificate: certMgr.GetCertificateFunc(certID),
+			GetCertificate: mgr.GetCertificateFunc(certID),
 			MinVersion:     util.GetTLSVersion(s.binding.MinTLSVersion),
 			NextProtos:     util.GetALPNProtocols(s.binding.Protocols),
 			CipherSuites:   util.GetTLSCiphersFromNames(s.binding.TLSCipherSuites),
@@ -91,7 +89,7 @@ func (s *webDavServer) listenAndServe(compressor *middleware.Compressor) error {
 		logger.Debug(logSender, "", "configured TLS cipher suites for binding %q: %v, certID: %v",
 			s.binding.GetAddress(), httpServer.TLSConfig.CipherSuites, certID)
 		if s.binding.isMutualTLSEnabled() {
-			httpServer.TLSConfig.ClientCAs = certMgr.GetRootCAs()
+			httpServer.TLSConfig.ClientCAs = mgr.GetRootCAs()
 			httpServer.TLSConfig.VerifyConnection = s.verifyTLSConnection
 			switch s.binding.ClientAuthType {
 			case 1:
@@ -104,13 +102,13 @@ func (s *webDavServer) listenAndServe(compressor *middleware.Compressor) error {
 			s.binding.listenerWrapper(), logSender)
 	}
 	s.binding.EnableHTTPS = false
-	serviceStatus.Bindings = append(serviceStatus.Bindings, s.binding)
+	addServiceStatusBinding(s.binding)
 	return util.HTTPListenAndServe(httpServer, s.binding.Address, s.binding.Port, false,
 		s.binding.listenerWrapper(), logSender)
 }
 
 func (s *webDavServer) verifyTLSConnection(state tls.ConnectionState) error {
-	if certMgr != nil {
+	if mgr := certMgr.Load(); mgr != nil {
 		var clientCrt *x509.Certificate
 		var clientCrtName string
 		if len(state.PeerCertificates) > 0 {
@@ -129,7 +127,7 @@ func (s *webDavServer) verifyTLSConnection(state tls.ConnectionState) error {
 			if len(verifiedChain) > 0 {
 				caCrt = verifiedChain[len(verifiedChain)-1]
 			}
-			if certMgr.IsRevoked(clientCrt, caCrt) {
+			if mgr.IsRevoked(clientCrt, caCrt) {
 				logger.Debug(logSender, "", "tls handshake error, client certificate %q has been revoked", clientCrtName)
 				return common.ErrCrtRevoked
 			}
@@ -170,6 +168,11 @@ func (s *webDavServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
+	responseControllerDeadlines(
+		http.NewResponseController(w),
+		time.Now().Add(60*time.Second),
+		time.Now().Add(60*time.Second),
+	)
 	w.Header().Set("Server", version.GetServerVersion("/", false))
 	ipAddr := s.checkRemoteAddress(r)
 
@@ -228,11 +231,9 @@ func (s *webDavServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	connection := &Connection{
-		BaseConnection: common.NewBaseConnection(connectionID, common.ProtocolWebDAV, util.GetHTTPLocalAddress(r),
-			r.RemoteAddr, user),
-		request: r,
-	}
+	baseConn := common.NewBaseConnection(connectionID, common.ProtocolWebDAV, util.GetHTTPLocalAddress(r),
+		r.RemoteAddr, user)
+	connection := newConnection(baseConn, w, r)
 	if err = common.Connections.Add(connection); err != nil {
 		errClose := user.CloseFs()
 		logger.Warn(logSender, connectionID, "unable add connection: %v close fs error: %v", err, errClose)
@@ -252,7 +253,7 @@ func (s *webDavServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if s.checkRequestMethod(ctx, r, connection) {
 		w.Header().Set("Content-Type", "text/xml; charset=utf-8")
 		w.WriteHeader(http.StatusMultiStatus)
-		w.Write([]byte("")) //nolint:errcheck
+		_, _ = w.Write([]byte(""))
 		writeLog(r, http.StatusMultiStatus, nil)
 		return
 	}
@@ -387,6 +388,15 @@ func (s *webDavServer) checkRemoteAddress(r *http.Request) string {
 		}
 	}
 	return ipAddr
+}
+
+func responseControllerDeadlines(rc *http.ResponseController, read, write time.Time) {
+	if err := rc.SetReadDeadline(read); err != nil {
+		logger.Error(logSender, "", "unable to set read timeout to %s: %v", read, err)
+	}
+	if err := rc.SetWriteDeadline(write); err != nil {
+		logger.Error(logSender, "", "unable to set write timeout to %s: %v", write, err)
+	}
 }
 
 func writeLog(r *http.Request, status int, err error) {

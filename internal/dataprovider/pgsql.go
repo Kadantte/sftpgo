@@ -40,11 +40,11 @@ import (
 
 const (
 	pgsqlResetSQL = `DROP TABLE IF EXISTS "{{api_keys}}" CASCADE;
-DROP TABLE IF EXISTS "{{folders_mapping}}" CASCADE;
 DROP TABLE IF EXISTS "{{users_folders_mapping}}" CASCADE;
 DROP TABLE IF EXISTS "{{users_groups_mapping}}" CASCADE;
 DROP TABLE IF EXISTS "{{admins_groups_mapping}}" CASCADE;
 DROP TABLE IF EXISTS "{{groups_folders_mapping}}" CASCADE;
+DROP TABLE IF EXISTS "{{shares_groups_mapping}}" CASCADE;
 DROP TABLE IF EXISTS "{{admins}}" CASCADE;
 DROP TABLE IF EXISTS "{{folders}}" CASCADE;
 DROP TABLE IF EXISTS "{{shares}}" CASCADE;
@@ -85,8 +85,8 @@ CREATE TABLE "{{folders}}" ("id" integer NOT NULL PRIMARY KEY GENERATED ALWAYS A
 "filesystem" text NULL);
 CREATE TABLE "{{groups}}" ("id" integer NOT NULL PRIMARY KEY GENERATED ALWAYS AS IDENTITY, "name" varchar(255) NOT NULL UNIQUE,
 "description" varchar(512) NULL, "created_at" bigint NOT NULL, "updated_at" bigint NOT NULL, "user_settings" text NULL);
-CREATE TABLE "{{shared_sessions}}" ("key" varchar(128) NOT NULL PRIMARY KEY,
-"data" text NOT NULL, "type" integer NOT NULL, "timestamp" bigint NOT NULL);
+CREATE TABLE "{{shared_sessions}}" ("key" varchar(128) NOT NULL, "type" integer NOT NULL,
+"data" text NOT NULL, "timestamp" bigint NOT NULL, PRIMARY KEY ("key", "type"));
 CREATE TABLE "{{users}}" ("id" integer NOT NULL PRIMARY KEY GENERATED ALWAYS AS IDENTITY, "username" varchar(255) NOT NULL UNIQUE, "status" integer NOT NULL,
 "expiration_date" bigint NOT NULL, "description" varchar(512) NULL, "password" text NULL, "public_keys" text NULL,
 "home_dir" text NOT NULL, "uid" bigint NOT NULL, "gid" bigint NOT NULL, "max_sessions" integer NOT NULL,
@@ -98,11 +98,11 @@ CREATE TABLE "{{users}}" ("id" integer NOT NULL PRIMARY KEY GENERATED ALWAYS AS 
 "used_upload_data_transfer" bigint NOT NULL, "used_download_data_transfer" bigint NOT NULL, "deleted_at" bigint NOT NULL,
 "first_download" bigint NOT NULL, "first_upload" bigint NOT NULL, "last_password_change" bigint NOT NULL, "role_id" integer NULL);
 CREATE TABLE "{{groups_folders_mapping}}" ("id" integer NOT NULL PRIMARY KEY GENERATED ALWAYS AS IDENTITY, "group_id" integer NOT NULL,
-"folder_id" integer NOT NULL, "virtual_path" text NOT NULL, "quota_size" bigint NOT NULL, "quota_files" integer NOT NULL);
+"folder_id" integer NOT NULL, "virtual_path" text NOT NULL, "quota_size" bigint NOT NULL, "quota_files" integer NOT NULL, "sort_order" integer NOT NULL);
 CREATE TABLE "{{users_groups_mapping}}" ("id" integer NOT NULL PRIMARY KEY GENERATED ALWAYS AS IDENTITY, "user_id" integer NOT NULL,
-"group_id" integer NOT NULL, "group_type" integer NOT NULL);
+"group_id" integer NOT NULL, "group_type" integer NOT NULL, "sort_order" integer NOT NULL);
 CREATE TABLE "{{users_folders_mapping}}" ("id" integer NOT NULL PRIMARY KEY GENERATED ALWAYS AS IDENTITY, "virtual_path" text NOT NULL,
-"quota_size" bigint NOT NULL, "quota_files" integer NOT NULL, "folder_id" integer NOT NULL, "user_id" integer NOT NULL);
+"quota_size" bigint NOT NULL, "quota_files" integer NOT NULL, "sort_order" integer NOT NULL, "folder_id" integer NOT NULL, "user_id" integer NOT NULL);
 ALTER TABLE "{{users_folders_mapping}}" ADD CONSTRAINT "{{prefix}}unique_user_folder_mapping" UNIQUE ("user_id", "folder_id");
 ALTER TABLE "{{users_folders_mapping}}" ADD CONSTRAINT "{{prefix}}users_folders_mapping_folder_id_fk_folders_id"
 FOREIGN KEY ("folder_id") REFERENCES "{{folders}}" ("id") MATCH SIMPLE ON UPDATE NO ACTION ON DELETE CASCADE;
@@ -112,7 +112,7 @@ CREATE TABLE "{{shares}}" ("id" integer NOT NULL PRIMARY KEY GENERATED ALWAYS AS
 "share_id" varchar(60) NOT NULL UNIQUE, "name" varchar(255) NOT NULL, "description" varchar(512) NULL,
 "scope" integer NOT NULL, "paths" text NOT NULL, "created_at" bigint NOT NULL, "updated_at" bigint NOT NULL,
 "last_use_at" bigint NOT NULL, "expires_at" bigint NOT NULL, "password" text NULL,
-"max_tokens" integer NOT NULL, "used_tokens" integer NOT NULL, "allow_from" text NULL,
+"max_tokens" integer NOT NULL, "used_tokens" integer NOT NULL, "allow_from" text NULL, "options" text NULL,
 "user_id" integer NOT NULL);
 ALTER TABLE "{{shares}}" ADD CONSTRAINT "{{prefix}}shares_user_id_fk_users_id" FOREIGN KEY ("user_id")
 REFERENCES "{{users}}" ("id") MATCH SIMPLE ON UPDATE NO ACTION ON DELETE CASCADE;
@@ -132,12 +132,14 @@ FOREIGN KEY ("group_id") REFERENCES "{{groups}}" ("id") MATCH SIMPLE ON UPDATE N
 CREATE INDEX "{{prefix}}users_groups_mapping_user_id_idx" ON "{{users_groups_mapping}}" ("user_id");
 ALTER TABLE "{{users_groups_mapping}}" ADD CONSTRAINT "{{prefix}}users_groups_mapping_user_id_fk_users_id"
 FOREIGN KEY ("user_id") REFERENCES "{{users}}" ("id") MATCH SIMPLE ON UPDATE NO ACTION ON DELETE CASCADE;
+CREATE INDEX "{{prefix}}users_groups_mapping_sort_order_idx" ON "{{users_groups_mapping}}" ("sort_order");
 CREATE INDEX "{{prefix}}groups_folders_mapping_folder_id_idx" ON "{{groups_folders_mapping}}" ("folder_id");
 ALTER TABLE "{{groups_folders_mapping}}" ADD CONSTRAINT "{{prefix}}groups_folders_mapping_folder_id_fk_folders_id"
 FOREIGN KEY ("folder_id") REFERENCES "{{folders}}" ("id") MATCH SIMPLE ON UPDATE NO ACTION ON DELETE CASCADE;
 CREATE INDEX "{{prefix}}groups_folders_mapping_group_id_idx" ON "{{groups_folders_mapping}}" ("group_id");
 ALTER TABLE "{{groups_folders_mapping}}" ADD CONSTRAINT "{{prefix}}groups_folders_mapping_group_id_fk_groups_id"
 FOREIGN KEY ("group_id") REFERENCES "{{groups}}" ("id") MATCH SIMPLE ON UPDATE NO ACTION ON DELETE CASCADE;
+CREATE INDEX "{{prefix}}groups_folders_mapping_sort_order_idx" ON "{{groups_folders_mapping}}" ("sort_order");
 CREATE TABLE "{{events_rules}}" ("id" integer NOT NULL PRIMARY KEY GENERATED ALWAYS AS IDENTITY, "name" varchar(255) NOT NULL UNIQUE,
 "status" integer NOT NULL, "description" varchar(512) NULL, "created_at" bigint NOT NULL, "updated_at" bigint NOT NULL,
 "trigger" integer NOT NULL, "conditions" text NOT NULL, "deleted_at" bigint NOT NULL);
@@ -153,7 +155,7 @@ FOREIGN KEY ("rule_id") REFERENCES "{{events_rules}}" ("id") MATCH SIMPLE ON UPD
 ALTER TABLE "{{rules_actions_mapping}}" ADD CONSTRAINT "{{prefix}}rules_actions_mapping_action_id_fk_events_targets_id"
 FOREIGN KEY ("action_id") REFERENCES "{{events_actions}}" ("id") MATCH SIMPLE ON UPDATE NO ACTION ON DELETE NO ACTION;
 CREATE TABLE "{{admins_groups_mapping}}" ("id" integer NOT NULL PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
-"admin_id" integer NOT NULL, "group_id" integer NOT NULL, "options" text NOT NULL);
+"admin_id" integer NOT NULL, "group_id" integer NOT NULL, "options" text NOT NULL, "sort_order" integer NOT NULL);
 ALTER TABLE "{{admins_groups_mapping}}" ADD CONSTRAINT "{{prefix}}unique_admin_group_mapping" UNIQUE ("admin_id", "group_id");
 ALTER TABLE "{{admins_groups_mapping}}" ADD CONSTRAINT "{{prefix}}admins_groups_mapping_admin_id_fk_admins_id"
 FOREIGN KEY ("admin_id") REFERENCES "{{admins}}" ("id") MATCH SIMPLE ON UPDATE NO ACTION ON DELETE CASCADE;
@@ -176,6 +178,7 @@ CREATE TABLE "{{configs}}" ("id" integer NOT NULL PRIMARY KEY GENERATED ALWAYS A
 INSERT INTO {{configs}} (configs) VALUES ('{}');
 CREATE INDEX "{{prefix}}users_folders_mapping_folder_id_idx" ON "{{users_folders_mapping}}" ("folder_id");
 CREATE INDEX "{{prefix}}users_folders_mapping_user_id_idx" ON "{{users_folders_mapping}}" ("user_id");
+CREATE INDEX "{{prefix}}users_folders_mapping_sort_order_idx" ON "{{users_folders_mapping}}" ("sort_order");
 CREATE INDEX "{{prefix}}api_keys_admin_id_idx" ON "{{api_keys}}" ("admin_id");
 CREATE INDEX "{{prefix}}api_keys_user_id_idx" ON "{{api_keys}}" ("user_id");
 CREATE INDEX "{{prefix}}users_updated_at_idx" ON "{{users}}" ("updated_at");
@@ -198,6 +201,7 @@ CREATE INDEX "{{prefix}}rules_actions_mapping_action_id_idx" ON "{{rules_actions
 CREATE INDEX "{{prefix}}rules_actions_mapping_order_idx" ON "{{rules_actions_mapping}}" ("order");
 CREATE INDEX "{{prefix}}admins_groups_mapping_admin_id_idx" ON "{{admins_groups_mapping}}" ("admin_id");
 CREATE INDEX "{{prefix}}admins_groups_mapping_group_id_idx" ON "{{admins_groups_mapping}}" ("group_id");
+CREATE INDEX "{{prefix}}admins_groups_mapping_sort_order_idx" ON "{{admins_groups_mapping}}" ("sort_order");
 CREATE INDEX "{{prefix}}admins_role_id_idx" ON "{{admins}}" ("role_id");
 CREATE INDEX "{{prefix}}users_role_id_idx" ON "{{users}}" ("role_id");
 CREATE INDEX "{{prefix}}ip_lists_type_idx" ON "{{ip_lists}}" ("type");
@@ -205,23 +209,147 @@ CREATE INDEX "{{prefix}}ip_lists_ipornet_idx" ON "{{ip_lists}}" ("ipornet");
 CREATE INDEX "{{prefix}}ip_lists_updated_at_idx" ON "{{ip_lists}}" ("updated_at");
 CREATE INDEX "{{prefix}}ip_lists_deleted_at_idx" ON "{{ip_lists}}" ("deleted_at");
 CREATE INDEX "{{prefix}}ip_lists_first_last_idx" ON "{{ip_lists}}" ("first", "last");
-INSERT INTO {{schema_version}} (version) VALUES (29);
+INSERT INTO {{schema_version}} (version) VALUES (33);
 `
 	// not supported in CockroachDB
 	ipListsLikeIndex = `CREATE INDEX "{{prefix}}ip_lists_ipornet_like_idx" ON "{{ip_lists}}" ("ipornet" varchar_pattern_ops);`
-	pgsqlV30SQL      = `ALTER TABLE "{{shares}}" ADD COLUMN "options" text NULL;`
-	pgsqlV30DownSQL  = `ALTER TABLE "{{shares}}" DROP COLUMN "options" CASCADE;`
-	pgsqlV31SQL      = `DROP TABLE "{{shared_sessions}}";
-CREATE TABLE "{{shared_sessions}}" ("key" varchar(128) NOT NULL, "type" integer NOT NULL,
-"data" text NOT NULL, "timestamp" bigint NOT NULL, PRIMARY KEY ("key", "type"));
-CREATE INDEX "{{prefix}}shared_sessions_type_idx" ON "{{shared_sessions}}" ("type");
-CREATE INDEX "{{prefix}}shared_sessions_timestamp_idx" ON "{{shared_sessions}}" ("timestamp");
+	pgsqlV34SQL      = `CREATE TABLE "{{shares_groups_mapping}}" (
+"id" integer NOT NULL PRIMARY KEY GENERATED BY DEFAULT AS IDENTITY,
+"share_id" integer NOT NULL,
+"group_id" integer NOT NULL,
+"permissions" integer NOT NULL,
+"sort_order" integer NOT NULL,
+CONSTRAINT "{{prefix}}unique_share_group_mapping" UNIQUE ("share_id", "group_id"),
+CONSTRAINT "{{prefix}}shares_groups_mapping_share_id_fk" FOREIGN KEY ("share_id") REFERENCES "{{shares}}"("id") ON DELETE CASCADE,
+CONSTRAINT "{{prefix}}shares_groups_mapping_group_id_fk" FOREIGN KEY ("group_id") REFERENCES "{{groups}}"("id") ON DELETE CASCADE);
+CREATE INDEX "{{prefix}}shares_groups_mapping_sort_order_idx" ON "{{shares_groups_mapping}}" ("sort_order");
+CREATE INDEX "{{prefix}}shares_groups_mapping_share_id_idx" ON "{{shares_groups_mapping}}" ("share_id");
+CREATE INDEX "{{prefix}}shares_groups_mapping_group_id_idx" ON "{{shares_groups_mapping}}" ("group_id");
 `
-	pgsqlV31DownSQL = `DROP TABLE "{{shared_sessions}}" CASCADE;
-CREATE TABLE "{{shared_sessions}}" ("key" varchar(128) NOT NULL PRIMARY KEY,
-"data" text NOT NULL, "type" integer NOT NULL, "timestamp" bigint NOT NULL);
-CREATE INDEX "{{prefix}}shared_sessions_type_idx" ON "{{shared_sessions}}" ("type");
-CREATE INDEX "{{prefix}}shared_sessions_timestamp_idx" ON "{{shared_sessions}}" ("timestamp");`
+	pgsqlV34DownSQL = `DROP TABLE IF EXISTS "{{shares_groups_mapping}}";`
+	pgsqlV35SQL     = `ALTER TABLE "{{users_folders_mapping}}" ADD COLUMN "exposed_subpaths" text NULL;
+ALTER TABLE "{{users_folders_mapping}}" ADD COLUMN "subpath" text DEFAULT '' NOT NULL;
+ALTER TABLE "{{users_folders_mapping}}" DROP CONSTRAINT "{{prefix}}unique_user_folder_mapping";
+ALTER TABLE "{{users_folders_mapping}}" ADD CONSTRAINT "{{prefix}}unique_user_folder_mapping" UNIQUE ("user_id", "folder_id", "subpath");
+ALTER TABLE "{{groups_folders_mapping}}" ADD COLUMN "exposed_subpaths" text NULL;
+ALTER TABLE "{{groups_folders_mapping}}" ADD COLUMN "subpath" text DEFAULT '' NOT NULL;
+ALTER TABLE "{{groups_folders_mapping}}" DROP CONSTRAINT "{{prefix}}unique_group_folder_mapping";
+ALTER TABLE "{{groups_folders_mapping}}" ADD CONSTRAINT "{{prefix}}unique_group_folder_mapping" UNIQUE ("group_id", "folder_id", "subpath");
+`
+	pgsqlV35DownSQL = `ALTER TABLE "{{users_folders_mapping}}" DROP COLUMN "subpath" CASCADE;
+ALTER TABLE "{{users_folders_mapping}}" DROP COLUMN "exposed_subpaths" CASCADE;
+ALTER TABLE "{{users_folders_mapping}}" ADD CONSTRAINT "{{prefix}}unique_user_folder_mapping" UNIQUE ("user_id", "folder_id");
+ALTER TABLE "{{groups_folders_mapping}}" DROP COLUMN "subpath" CASCADE;
+ALTER TABLE "{{groups_folders_mapping}}" DROP COLUMN "exposed_subpaths" CASCADE;
+ALTER TABLE "{{groups_folders_mapping}}" ADD CONSTRAINT "{{prefix}}unique_group_folder_mapping" UNIQUE ("group_id", "folder_id");
+`
+	pgsqlV36SQL = `ALTER TABLE "{{groups}}" ADD COLUMN "role_id" integer NULL;
+ALTER TABLE "{{folders}}" ADD COLUMN "role_id" integer NULL;
+CREATE INDEX "{{prefix}}groups_role_id_idx" ON "{{groups}}" ("role_id");
+CREATE INDEX "{{prefix}}folders_role_id_idx" ON "{{folders}}" ("role_id");
+ALTER TABLE "{{groups}}" ADD CONSTRAINT "{{prefix}}groups_role_id_fk_roles_id" FOREIGN KEY ("role_id")
+REFERENCES "{{roles}}" ("id") ON DELETE NO ACTION;
+ALTER TABLE "{{folders}}" ADD CONSTRAINT "{{prefix}}folders_role_id_fk_roles_id" FOREIGN KEY ("role_id")
+REFERENCES "{{roles}}" ("id") ON DELETE NO ACTION;
+ALTER TABLE "{{roles}}" ADD COLUMN "resource_isolation" integer DEFAULT 0 NOT NULL;
+ALTER TABLE "{{roles}}" ADD COLUMN "settings" text NULL;
+ALTER TABLE "{{users_folders_mapping}}" DROP CONSTRAINT "{{prefix}}users_folders_mapping_folder_id_fk_folders_id";
+ALTER TABLE "{{users_folders_mapping}}" ADD CONSTRAINT "{{prefix}}users_folders_mapping_folder_id_fk_folders_id"
+FOREIGN KEY ("folder_id") REFERENCES "{{folders}}" ("id") MATCH SIMPLE ON UPDATE NO ACTION ON DELETE NO ACTION;
+ALTER TABLE "{{groups_folders_mapping}}" DROP CONSTRAINT "{{prefix}}groups_folders_mapping_folder_id_fk_folders_id";
+ALTER TABLE "{{groups_folders_mapping}}" ADD CONSTRAINT "{{prefix}}groups_folders_mapping_folder_id_fk_folders_id"
+FOREIGN KEY ("folder_id") REFERENCES "{{folders}}" ("id") MATCH SIMPLE ON UPDATE NO ACTION ON DELETE NO ACTION;
+ALTER TABLE "{{admins_groups_mapping}}" DROP CONSTRAINT "{{prefix}}admins_groups_mapping_group_id_fk_groups_id";
+ALTER TABLE "{{admins_groups_mapping}}" ADD CONSTRAINT "{{prefix}}admins_groups_mapping_group_id_fk_groups_id"
+FOREIGN KEY ("group_id") REFERENCES "{{groups}}" ("id") MATCH SIMPLE ON UPDATE NO ACTION ON DELETE NO ACTION;
+ALTER TABLE "{{users}}" DROP CONSTRAINT "{{prefix}}users_role_id_fk_roles_id";
+ALTER TABLE "{{users}}" ADD CONSTRAINT "{{prefix}}users_role_id_fk_roles_id" FOREIGN KEY ("role_id")
+REFERENCES "{{roles}}" ("id") ON DELETE NO ACTION;
+`
+	pgsqlV36DownSQL = `ALTER TABLE "{{groups}}" DROP COLUMN "role_id" CASCADE;
+ALTER TABLE "{{folders}}" DROP COLUMN "role_id" CASCADE;
+ALTER TABLE "{{roles}}" DROP COLUMN "settings" CASCADE;
+ALTER TABLE "{{roles}}" DROP COLUMN "resource_isolation" CASCADE;
+ALTER TABLE "{{users_folders_mapping}}" DROP CONSTRAINT "{{prefix}}users_folders_mapping_folder_id_fk_folders_id";
+ALTER TABLE "{{users_folders_mapping}}" ADD CONSTRAINT "{{prefix}}users_folders_mapping_folder_id_fk_folders_id"
+FOREIGN KEY ("folder_id") REFERENCES "{{folders}}" ("id") MATCH SIMPLE ON UPDATE NO ACTION ON DELETE CASCADE;
+ALTER TABLE "{{groups_folders_mapping}}" DROP CONSTRAINT "{{prefix}}groups_folders_mapping_folder_id_fk_folders_id";
+ALTER TABLE "{{groups_folders_mapping}}" ADD CONSTRAINT "{{prefix}}groups_folders_mapping_folder_id_fk_folders_id"
+FOREIGN KEY ("folder_id") REFERENCES "{{folders}}" ("id") MATCH SIMPLE ON UPDATE NO ACTION ON DELETE CASCADE;
+ALTER TABLE "{{admins_groups_mapping}}" DROP CONSTRAINT "{{prefix}}admins_groups_mapping_group_id_fk_groups_id";
+ALTER TABLE "{{admins_groups_mapping}}" ADD CONSTRAINT "{{prefix}}admins_groups_mapping_group_id_fk_groups_id"
+FOREIGN KEY ("group_id") REFERENCES "{{groups}}" ("id") MATCH SIMPLE ON UPDATE NO ACTION ON DELETE CASCADE;
+ALTER TABLE "{{users}}" DROP CONSTRAINT "{{prefix}}users_role_id_fk_roles_id";
+ALTER TABLE "{{users}}" ADD CONSTRAINT "{{prefix}}users_role_id_fk_roles_id" FOREIGN KEY ("role_id")
+REFERENCES "{{roles}}" ("id") ON DELETE SET NULL;
+`
+)
+
+// CockroachDB executes DDL inside an explicit transaction as async schema
+// change jobs: the commit succeeds even when a job later fails (verified: a
+// unique-constraint backfill hitting duplicates failed after a successful
+// commit, letting the migration proceed). An autocommit DDL statement
+// instead blocks until its job completes and reports its error, so every
+// migration altering the schema runs its statements one by one outside
+// transactions, each idempotent via IF [NOT] EXISTS so a partial failure can
+// be retried. PostgreSQL keeps the strict statements in a single transaction:
+// it has transactional DDL, does not support ADD CONSTRAINT IF NOT EXISTS and
+// ADD COLUMN IF NOT EXISTS would accept a pre-existing column of a different
+// type. The v35 downgrade re-adds the narrow constraints BEFORE dropping the
+// columns: a multi-mount conflict then aborts while the data is still intact.
+var (
+	crdbV36SQL = []string{
+		`ALTER TABLE "{{groups}}" ADD COLUMN IF NOT EXISTS "role_id" integer NULL`,
+		`ALTER TABLE "{{folders}}" ADD COLUMN IF NOT EXISTS "role_id" integer NULL`,
+		`CREATE INDEX IF NOT EXISTS "{{prefix}}groups_role_id_idx" ON "{{groups}}" ("role_id")`,
+		`CREATE INDEX IF NOT EXISTS "{{prefix}}folders_role_id_idx" ON "{{folders}}" ("role_id")`,
+		`ALTER TABLE "{{groups}}" ADD CONSTRAINT IF NOT EXISTS "{{prefix}}groups_role_id_fk_roles_id" FOREIGN KEY ("role_id") REFERENCES "{{roles}}" ("id") ON DELETE NO ACTION`,
+		`ALTER TABLE "{{folders}}" ADD CONSTRAINT IF NOT EXISTS "{{prefix}}folders_role_id_fk_roles_id" FOREIGN KEY ("role_id") REFERENCES "{{roles}}" ("id") ON DELETE NO ACTION`,
+		`ALTER TABLE "{{roles}}" ADD COLUMN IF NOT EXISTS "resource_isolation" integer DEFAULT 0 NOT NULL`,
+		`ALTER TABLE "{{roles}}" ADD COLUMN IF NOT EXISTS "settings" text NULL`,
+		`ALTER TABLE "{{users_folders_mapping}}" DROP CONSTRAINT IF EXISTS "{{prefix}}users_folders_mapping_folder_id_fk_folders_id"`,
+		`ALTER TABLE "{{users_folders_mapping}}" ADD CONSTRAINT IF NOT EXISTS "{{prefix}}users_folders_mapping_folder_id_fk_folders_id" FOREIGN KEY ("folder_id") REFERENCES "{{folders}}" ("id") MATCH SIMPLE ON UPDATE NO ACTION ON DELETE NO ACTION`,
+		`ALTER TABLE "{{groups_folders_mapping}}" DROP CONSTRAINT IF EXISTS "{{prefix}}groups_folders_mapping_folder_id_fk_folders_id"`,
+		`ALTER TABLE "{{groups_folders_mapping}}" ADD CONSTRAINT IF NOT EXISTS "{{prefix}}groups_folders_mapping_folder_id_fk_folders_id" FOREIGN KEY ("folder_id") REFERENCES "{{folders}}" ("id") MATCH SIMPLE ON UPDATE NO ACTION ON DELETE NO ACTION`,
+		`ALTER TABLE "{{admins_groups_mapping}}" DROP CONSTRAINT IF EXISTS "{{prefix}}admins_groups_mapping_group_id_fk_groups_id"`,
+		`ALTER TABLE "{{admins_groups_mapping}}" ADD CONSTRAINT IF NOT EXISTS "{{prefix}}admins_groups_mapping_group_id_fk_groups_id" FOREIGN KEY ("group_id") REFERENCES "{{groups}}" ("id") MATCH SIMPLE ON UPDATE NO ACTION ON DELETE NO ACTION`,
+		`ALTER TABLE "{{users}}" DROP CONSTRAINT IF EXISTS "{{prefix}}users_role_id_fk_roles_id"`,
+		`ALTER TABLE "{{users}}" ADD CONSTRAINT IF NOT EXISTS "{{prefix}}users_role_id_fk_roles_id" FOREIGN KEY ("role_id") REFERENCES "{{roles}}" ("id") ON DELETE NO ACTION`,
+	}
+	crdbV36DownSQL = []string{
+		`ALTER TABLE "{{groups}}" DROP COLUMN IF EXISTS "role_id" CASCADE`,
+		`ALTER TABLE "{{folders}}" DROP COLUMN IF EXISTS "role_id" CASCADE`,
+		`ALTER TABLE "{{roles}}" DROP COLUMN IF EXISTS "settings" CASCADE`,
+		`ALTER TABLE "{{roles}}" DROP COLUMN IF EXISTS "resource_isolation" CASCADE`,
+		`ALTER TABLE "{{users_folders_mapping}}" DROP CONSTRAINT IF EXISTS "{{prefix}}users_folders_mapping_folder_id_fk_folders_id"`,
+		`ALTER TABLE "{{users_folders_mapping}}" ADD CONSTRAINT IF NOT EXISTS "{{prefix}}users_folders_mapping_folder_id_fk_folders_id" FOREIGN KEY ("folder_id") REFERENCES "{{folders}}" ("id") MATCH SIMPLE ON UPDATE NO ACTION ON DELETE CASCADE`,
+		`ALTER TABLE "{{groups_folders_mapping}}" DROP CONSTRAINT IF EXISTS "{{prefix}}groups_folders_mapping_folder_id_fk_folders_id"`,
+		`ALTER TABLE "{{groups_folders_mapping}}" ADD CONSTRAINT IF NOT EXISTS "{{prefix}}groups_folders_mapping_folder_id_fk_folders_id" FOREIGN KEY ("folder_id") REFERENCES "{{folders}}" ("id") MATCH SIMPLE ON UPDATE NO ACTION ON DELETE CASCADE`,
+		`ALTER TABLE "{{admins_groups_mapping}}" DROP CONSTRAINT IF EXISTS "{{prefix}}admins_groups_mapping_group_id_fk_groups_id"`,
+		`ALTER TABLE "{{admins_groups_mapping}}" ADD CONSTRAINT IF NOT EXISTS "{{prefix}}admins_groups_mapping_group_id_fk_groups_id" FOREIGN KEY ("group_id") REFERENCES "{{groups}}" ("id") MATCH SIMPLE ON UPDATE NO ACTION ON DELETE CASCADE`,
+		`ALTER TABLE "{{users}}" DROP CONSTRAINT IF EXISTS "{{prefix}}users_role_id_fk_roles_id"`,
+		`ALTER TABLE "{{users}}" ADD CONSTRAINT IF NOT EXISTS "{{prefix}}users_role_id_fk_roles_id" FOREIGN KEY ("role_id") REFERENCES "{{roles}}" ("id") ON DELETE SET NULL`,
+	}
+	crdbV35SQL = []string{
+		`ALTER TABLE "{{users_folders_mapping}}" ADD COLUMN IF NOT EXISTS "exposed_subpaths" text NULL`,
+		`ALTER TABLE "{{users_folders_mapping}}" ADD COLUMN IF NOT EXISTS "subpath" text DEFAULT '' NOT NULL`,
+		`ALTER TABLE "{{groups_folders_mapping}}" ADD COLUMN IF NOT EXISTS "exposed_subpaths" text NULL`,
+		`ALTER TABLE "{{groups_folders_mapping}}" ADD COLUMN IF NOT EXISTS "subpath" text DEFAULT '' NOT NULL`,
+		`ALTER TABLE "{{users_folders_mapping}}" DROP CONSTRAINT IF EXISTS "{{prefix}}unique_user_folder_mapping"`,
+		`ALTER TABLE "{{groups_folders_mapping}}" DROP CONSTRAINT IF EXISTS "{{prefix}}unique_group_folder_mapping"`,
+		`ALTER TABLE "{{users_folders_mapping}}" ADD CONSTRAINT IF NOT EXISTS "{{prefix}}unique_user_folder_mapping" UNIQUE ("user_id", "folder_id", "subpath")`,
+		`ALTER TABLE "{{groups_folders_mapping}}" ADD CONSTRAINT IF NOT EXISTS "{{prefix}}unique_group_folder_mapping" UNIQUE ("group_id", "folder_id", "subpath")`,
+	}
+	crdbV35DownSQL = []string{
+		`ALTER TABLE "{{users_folders_mapping}}" DROP CONSTRAINT IF EXISTS "{{prefix}}unique_user_folder_mapping"`,
+		`ALTER TABLE "{{groups_folders_mapping}}" DROP CONSTRAINT IF EXISTS "{{prefix}}unique_group_folder_mapping"`,
+		`ALTER TABLE "{{users_folders_mapping}}" ADD CONSTRAINT IF NOT EXISTS "{{prefix}}unique_user_folder_mapping" UNIQUE ("user_id", "folder_id")`,
+		`ALTER TABLE "{{groups_folders_mapping}}" ADD CONSTRAINT IF NOT EXISTS "{{prefix}}unique_group_folder_mapping" UNIQUE ("group_id", "folder_id")`,
+		`ALTER TABLE "{{users_folders_mapping}}" DROP COLUMN IF EXISTS "subpath" CASCADE`,
+		`ALTER TABLE "{{users_folders_mapping}}" DROP COLUMN IF EXISTS "exposed_subpaths" CASCADE`,
+		`ALTER TABLE "{{groups_folders_mapping}}" DROP COLUMN IF EXISTS "subpath" CASCADE`,
+		`ALTER TABLE "{{groups_folders_mapping}}" DROP COLUMN IF EXISTS "exposed_subpaths" CASCADE`,
+	}
 )
 
 var (
@@ -807,23 +935,59 @@ func (p *PGSQLProvider) initializeDatabase() error {
 	if err == nil && dbVersion.Version > 0 {
 		return ErrNoInitRequired
 	}
-	if errors.Is(err, sql.ErrNoRows) {
+	if errors.Is(err, sql.ErrNoRows) && config.Driver != CockroachDataProviderName {
+		// on CockroachDB an empty schema_version is the footprint of an
+		// interrupted initialization: the statements are idempotent, so
+		// the retry below completes the missing pieces.
 		return errSchemaVersionEmpty
 	}
-	logger.InfoToConsole("creating initial database schema, version 29")
-	providerLog(logger.LevelInfo, "creating initial database schema, version 29")
-	var initialSQL string
+	logger.InfoToConsole("creating initial database schema, version 33")
+	providerLog(logger.LevelInfo, "creating initial database schema, version 33")
 	if config.Driver == CockroachDataProviderName {
-		initialSQL = sqlReplaceAll(pgsqlInitial)
-		initialSQL = strings.ReplaceAll(initialSQL, "GENERATED ALWAYS AS IDENTITY", "DEFAULT unordered_unique_rowid()")
-	} else {
-		initialSQL = sqlReplaceAll(pgsqlInitial + ipListsLikeIndex)
+		return runCRDBStatements(p.dbHandle, crdbInitialStatements(), 33, true)
 	}
-
-	return sqlCommonExecSQLAndUpdateDBVersion(p.dbHandle, []string{initialSQL}, 29, true)
+	initialSQL := sqlReplaceAll(pgsqlInitial + ipListsLikeIndex)
+	return sqlCommonExecSQLAndUpdateDBVersion(p.dbHandle, []string{initialSQL}, 33, true)
 }
 
-func (p *PGSQLProvider) migrateDatabase() error { //nolint:dupl
+// crdbIdempotentStatements splits the given SQL into individual statements and
+// rewrites them so that each one can be re-executed. On CockroachDB the
+// migration takes no lock and a statement can fail after previous ones are
+// already applied, so a retry must be able to run the whole script again.
+func crdbIdempotentStatements(sql string) []string {
+	for _, r := range []struct {
+		old string
+		new string
+	}{
+		{"CREATE TABLE ", "CREATE TABLE IF NOT EXISTS "},
+		{"CREATE INDEX ", "CREATE INDEX IF NOT EXISTS "},
+		{"ADD COLUMN ", "ADD COLUMN IF NOT EXISTS "},
+		{"ADD CONSTRAINT ", "ADD CONSTRAINT IF NOT EXISTS "},
+		{"DROP TABLE ", "DROP TABLE IF EXISTS "},
+		{"DROP COLUMN ", "DROP COLUMN IF EXISTS "},
+		{"DROP CONSTRAINT ", "DROP CONSTRAINT IF EXISTS "},
+	} {
+		sql = strings.ReplaceAll(sql, r.old, r.new)
+	}
+	// statements that already carried the clause now have it twice
+	sql = strings.ReplaceAll(sql, "IF NOT EXISTS IF NOT EXISTS ", "IF NOT EXISTS ")
+	sql = strings.ReplaceAll(sql, "IF EXISTS IF EXISTS ", "IF EXISTS ")
+	return strings.Split(sql, ";")
+}
+
+// crdbInitialStatements returns the initial schema as individual idempotent
+// statements for runCRDBStatements.
+func crdbInitialStatements() []string {
+	initialSQL := sqlReplaceAll(pgsqlInitial)
+	initialSQL = strings.ReplaceAll(initialSQL, "GENERATED ALWAYS AS IDENTITY", "DEFAULT unordered_unique_rowid()")
+	initialSQL = strings.ReplaceAll(initialSQL,
+		fmt.Sprintf("INSERT INTO %s (configs) VALUES ('{}')", sqlTableConfigs),
+		fmt.Sprintf("INSERT INTO %s (configs) SELECT '{}' WHERE NOT EXISTS (SELECT id FROM %s)",
+			sqlTableConfigs, sqlTableConfigs))
+	return crdbIdempotentStatements(initialSQL)
+}
+
+func (p *PGSQLProvider) migrateDatabase() error {
 	dbVersion, err := sqlCommonGetDatabaseVersion(p.dbHandle, true)
 	if err != nil {
 		return err
@@ -833,17 +997,17 @@ func (p *PGSQLProvider) migrateDatabase() error { //nolint:dupl
 	case version == sqlDatabaseVersion:
 		providerLog(logger.LevelDebug, "sql database is up to date, current version: %d", version)
 		return ErrNoInitRequired
-	case version < 29:
+	case version < 33:
 		err = errSchemaVersionTooOld(version)
 		providerLog(logger.LevelError, "%v", err)
 		logger.ErrorToConsole("%v", err)
 		return err
-	case version == 29:
-		return updatePGSQLDatabaseFromV29(p.dbHandle)
-	case version == 30:
-		return updatePGSQLDatabaseFromV30(p.dbHandle)
-	case version == 31:
-		return updatePGSQLDatabaseFromV31(p.dbHandle)
+	case version == 33:
+		return updatePGSQLDatabaseFromV33(p.dbHandle)
+	case version == 34:
+		return updatePGSQLDatabaseFromV34(p.dbHandle)
+	case version == 35:
+		return updatePGSQLDatabaseFromV35(p.dbHandle)
 	default:
 		if version > sqlDatabaseVersion {
 			providerLog(logger.LevelError, "database schema version %d is newer than the supported one: %d", version,
@@ -866,12 +1030,12 @@ func (p *PGSQLProvider) revertDatabase(targetVersion int) error {
 	}
 
 	switch dbVersion.Version {
-	case 30:
-		return downgradePGSQLDatabaseFromV30(p.dbHandle)
-	case 31:
-		return downgradePGSQLDatabaseFromV31(p.dbHandle)
-	case 32:
-		return downgradePGSQLDatabaseFromV32(p.dbHandle)
+	case 34:
+		return downgradePGSQLDatabaseFromV34(p.dbHandle)
+	case 35:
+		return downgradePGSQLDatabaseFromV35(p.dbHandle)
+	case 36:
+		return downgradePGSQLDatabaseFromV36(p.dbHandle)
 	default:
 		return fmt.Errorf("database schema version not handled: %d", dbVersion.Version)
 	}
@@ -886,8 +1050,7 @@ func (p *PGSQLProvider) normalizeError(err error, fieldType int) error {
 	if err == nil {
 		return nil
 	}
-	var pgsqlErr *pgconn.PgError
-	if errors.As(err, &pgsqlErr) {
+	if pgsqlErr, ok := errors.AsType[*pgconn.PgError](err); ok {
 		switch pgsqlErr.Code {
 		case "23505":
 			var message string
@@ -910,72 +1073,151 @@ func (p *PGSQLProvider) normalizeError(err error, fieldType int) error {
 	return err
 }
 
-func updatePGSQLDatabaseFromV29(dbHandle *sql.DB) error {
-	if err := updatePGSQLDatabaseFrom29To30(dbHandle); err != nil {
+func updatePGSQLDatabaseFromV33(dbHandle *sql.DB) error {
+	if err := updatePGSQLDatabaseFrom33To34(dbHandle); err != nil {
 		return err
 	}
-	return updatePGSQLDatabaseFromV30(dbHandle)
+	return updatePGSQLDatabaseFromV34(dbHandle)
 }
 
-func updatePGSQLDatabaseFromV30(dbHandle *sql.DB) error {
-	if err := updatePGSQLDatabaseFrom30To31(dbHandle); err != nil {
+func updatePGSQLDatabaseFromV34(dbHandle *sql.DB) error {
+	if err := updatePGSQLDatabaseFrom34To35(dbHandle); err != nil {
 		return err
 	}
-	return updatePGSQLDatabaseFromV31(dbHandle)
+	return updatePGSQLDatabaseFromV35(dbHandle)
 }
 
-func updatePGSQLDatabaseFromV31(dbHandle *sql.DB) error {
-	return updateSQLDatabaseFrom31To32(dbHandle)
+func updatePGSQLDatabaseFromV35(dbHandle *sql.DB) error {
+	return updatePGSQLDatabaseFrom35To36(dbHandle)
 }
 
-func downgradePGSQLDatabaseFromV30(dbHandle *sql.DB) error {
-	return downgradePGSQLDatabaseFrom30To29(dbHandle)
+func downgradePGSQLDatabaseFromV34(dbHandle *sql.DB) error {
+	return downgradePGSQLDatabaseFrom34To33(dbHandle)
 }
 
-func downgradePGSQLDatabaseFromV31(dbHandle *sql.DB) error {
-	if err := downgradePGSQLDatabaseFrom31To30(dbHandle); err != nil {
+func downgradePGSQLDatabaseFromV35(dbHandle *sql.DB) error {
+	if err := downgradePGSQLDatabaseFrom35To34(dbHandle); err != nil {
 		return err
 	}
-	return downgradePGSQLDatabaseFromV30(dbHandle)
+	return downgradePGSQLDatabaseFromV34(dbHandle)
 }
 
-func downgradePGSQLDatabaseFromV32(dbHandle *sql.DB) error {
-	if err := downgradeSQLDatabaseFrom32To31(dbHandle); err != nil {
+func downgradePGSQLDatabaseFromV36(dbHandle *sql.DB) error {
+	if err := downgradePGSQLDatabaseFrom36To35(dbHandle); err != nil {
 		return err
 	}
-	return downgradePGSQLDatabaseFromV31(dbHandle)
+	return downgradePGSQLDatabaseFromV35(dbHandle)
 }
 
-func updatePGSQLDatabaseFrom29To30(dbHandle *sql.DB) error {
-	logger.InfoToConsole("updating database schema version: 29 -> 30")
-	providerLog(logger.LevelInfo, "updating database schema version: 29 -> 30")
+func updatePGSQLDatabaseFrom33To34(dbHandle *sql.DB) error {
+	logger.InfoToConsole("updating database schema version: 33 -> 34")
+	providerLog(logger.LevelInfo, "updating database schema version: 33 -> 34")
 
-	sql := strings.ReplaceAll(pgsqlV30SQL, "{{shares}}", sqlTableShares)
-	return sqlCommonExecSQLAndUpdateDBVersion(dbHandle, []string{sql}, 30, true)
+	sql := strings.ReplaceAll(pgsqlV34SQL, "{{prefix}}", config.SQLTablesPrefix)
+	sql = strings.ReplaceAll(sql, "{{shares}}", sqlTableShares)
+	sql = strings.ReplaceAll(sql, "{{shares_groups_mapping}}", sqlTableSharesGroupsMapping)
+	sql = strings.ReplaceAll(sql, "{{groups}}", sqlTableGroups)
+	if config.Driver == CockroachDataProviderName {
+		return runCRDBStatements(dbHandle, crdbIdempotentStatements(sql), 34, true)
+	}
+	return sqlCommonExecSQLAndUpdateDBVersion(dbHandle, []string{sql}, 34, true)
 }
 
-func downgradePGSQLDatabaseFrom30To29(dbHandle *sql.DB) error {
-	logger.InfoToConsole("downgrading database schema version: 30 -> 29")
-	providerLog(logger.LevelInfo, "downgrading database schema version: 30 -> 29")
+func downgradePGSQLDatabaseFrom34To33(dbHandle *sql.DB) error {
+	logger.InfoToConsole("downgrading database schema version: 34 -> 33")
+	providerLog(logger.LevelInfo, "downgrading database schema version: 34 -> 33")
 
-	sql := strings.ReplaceAll(pgsqlV30DownSQL, "{{shares}}", sqlTableShares)
-	return sqlCommonExecSQLAndUpdateDBVersion(dbHandle, []string{sql}, 29, false)
+	sql := strings.ReplaceAll(pgsqlV34DownSQL, "{{shares_groups_mapping}}", sqlTableSharesGroupsMapping)
+	if config.Driver == CockroachDataProviderName {
+		return runCRDBStatements(dbHandle, crdbIdempotentStatements(sql), 33, false)
+	}
+	return sqlCommonExecSQLAndUpdateDBVersion(dbHandle, []string{sql}, 33, false)
 }
 
-func updatePGSQLDatabaseFrom30To31(dbHandle *sql.DB) error {
-	logger.InfoToConsole("updating database schema version: 30 -> 31")
-	providerLog(logger.LevelInfo, "updating database schema version: 30 -> 31")
-
-	sql := strings.ReplaceAll(pgsqlV31SQL, "{{shared_sessions}}", sqlTableSharedSessions)
+func replaceV35MappingTablesPlaceholders(sql string) string {
 	sql = strings.ReplaceAll(sql, "{{prefix}}", config.SQLTablesPrefix)
-	return sqlCommonExecSQLAndUpdateDBVersion(dbHandle, []string{sql}, 31, true)
+	sql = strings.ReplaceAll(sql, "{{users_folders_mapping}}", sqlTableUsersFoldersMapping)
+	return strings.ReplaceAll(sql, "{{groups_folders_mapping}}", sqlTableGroupsFoldersMapping)
 }
 
-func downgradePGSQLDatabaseFrom31To30(dbHandle *sql.DB) error {
-	logger.InfoToConsole("downgrading database schema version: 31 -> 30")
-	providerLog(logger.LevelInfo, "downgrading database schema version: 31 -> 30")
+func replaceV35MappingTablesPlaceholdersList(statements []string) []string {
+	result := make([]string, 0, len(statements))
+	for _, q := range statements {
+		result = append(result, replaceV35MappingTablesPlaceholders(q))
+	}
+	return result
+}
 
-	sql := strings.ReplaceAll(pgsqlV31DownSQL, "{{shared_sessions}}", sqlTableSharedSessions)
-	sql = strings.ReplaceAll(sql, "{{prefix}}", config.SQLTablesPrefix)
-	return sqlCommonExecSQLAndUpdateDBVersion(dbHandle, []string{sql}, 30, false)
+func runCRDBStatements(dbHandle *sql.DB, statements []string, newVersion int, isUp bool) error {
+	if currentVersion, err := sqlCommonGetDatabaseVersion(dbHandle, false); err == nil {
+		if (isUp && currentVersion.Version >= newVersion) || (!isUp && currentVersion.Version <= newVersion) {
+			providerLog(logger.LevelInfo, "current schema version: %d, requested: %d, did you execute simultaneous migrations?",
+				currentVersion.Version, newVersion)
+			return nil
+		}
+	}
+	execStatement := func(q string) error {
+		ctx, cancel := context.WithTimeout(context.Background(), longSQLQueryTimeout)
+		defer cancel()
+
+		_, err := dbHandle.ExecContext(ctx, q)
+		return err
+	}
+	for _, q := range statements {
+		q = strings.TrimSpace(q)
+		if q == "" {
+			continue
+		}
+		if err := execStatement(q); err != nil {
+			return err
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), defaultSQLQueryTimeout)
+	defer cancel()
+
+	return sqlCommonUpdateDatabaseVersion(ctx, dbHandle, newVersion)
+}
+
+func updatePGSQLDatabaseFrom34To35(dbHandle *sql.DB) error {
+	logger.InfoToConsole("updating database schema version: 34 -> 35")
+	providerLog(logger.LevelInfo, "updating database schema version: 34 -> 35")
+
+	if config.Driver == CockroachDataProviderName {
+		return runCRDBStatements(dbHandle, replaceV35MappingTablesPlaceholdersList(crdbV35SQL), 35, true)
+	}
+	sql := replaceV35MappingTablesPlaceholders(pgsqlV35SQL)
+	return sqlCommonExecSQLAndUpdateDBVersion(dbHandle, []string{sql}, 35, true)
+}
+
+func downgradePGSQLDatabaseFrom35To34(dbHandle *sql.DB) error {
+	logger.InfoToConsole("downgrading database schema version: 35 -> 34")
+	providerLog(logger.LevelInfo, "downgrading database schema version: 35 -> 34")
+
+	if config.Driver == CockroachDataProviderName {
+		return runCRDBStatements(dbHandle, replaceV35MappingTablesPlaceholdersList(crdbV35DownSQL), 34, false)
+	}
+	sql := replaceV35MappingTablesPlaceholders(pgsqlV35DownSQL)
+	return sqlCommonExecSQLAndUpdateDBVersion(dbHandle, []string{sql}, 34, false)
+}
+
+func updatePGSQLDatabaseFrom35To36(dbHandle *sql.DB) error {
+	logger.InfoToConsole("updating database schema version: 35 -> 36")
+	providerLog(logger.LevelInfo, "updating database schema version: 35 -> 36")
+
+	if config.Driver == CockroachDataProviderName {
+		return runCRDBStatements(dbHandle, sqlReplaceAllList(crdbV36SQL), 36, true)
+	}
+	sql := sqlReplaceAll(pgsqlV36SQL)
+	return sqlCommonExecSQLAndUpdateDBVersion(dbHandle, []string{sql}, 36, true)
+}
+
+func downgradePGSQLDatabaseFrom36To35(dbHandle *sql.DB) error {
+	logger.InfoToConsole("downgrading database schema version: 36 -> 35")
+	providerLog(logger.LevelInfo, "downgrading database schema version: 36 -> 35")
+
+	if config.Driver == CockroachDataProviderName {
+		return runCRDBStatements(dbHandle, sqlReplaceAllList(crdbV36DownSQL), 35, false)
+	}
+	sql := sqlReplaceAll(pgsqlV36DownSQL)
+	return sqlCommonExecSQLAndUpdateDBVersion(dbHandle, []string{sql}, 35, false)
 }

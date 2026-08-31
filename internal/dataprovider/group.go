@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/sftpgo/sdk"
@@ -40,7 +41,7 @@ type GroupUserSettings struct {
 type Group struct {
 	sdk.BaseGroup
 	// settings to apply to users for whom this is a primary group
-	UserSettings GroupUserSettings `json:"user_settings,omitempty"`
+	UserSettings GroupUserSettings `json:"user_settings"`
 	// Mapping between virtual paths and virtual folders
 	VirtualFolders []vfs.VirtualFolder `json:"virtual_folders,omitempty"`
 }
@@ -132,10 +133,21 @@ func (g *Group) hasRedactedSecret() bool {
 	return g.UserSettings.FsConfig.HasRedactedSecret()
 }
 
+func (g *Group) applyNamingRules() {
+	g.Name = config.convertName(g.Name)
+	for idx := range g.VirtualFolders {
+		g.VirtualFolders[idx].Name = config.convertName(g.VirtualFolders[idx].Name)
+	}
+}
+
 func (g *Group) validate() error {
 	g.SetEmptySecretsIfNil()
+	g.applyNamingRules()
 	if g.Name == "" {
 		return util.NewI18nError(util.NewValidationError("name is mandatory"), util.I18nErrorNameRequired)
+	}
+	if !util.IsNameValid(g.Name) {
+		return util.NewI18nError(errInvalidInput, util.I18nErrorInvalidInput)
 	}
 	if config.NamingRules&1 == 0 && !usernameRegex.MatchString(g.Name) {
 		return util.NewI18nError(
@@ -202,9 +214,7 @@ func (g *Group) getACopy() Group {
 	}
 	permissions := make(map[string][]string)
 	for k, v := range g.UserSettings.Permissions {
-		perms := make([]string, len(v))
-		copy(perms, v)
-		permissions[k] = perms
+		permissions[k] = slices.Clone(v)
 	}
 
 	return Group{

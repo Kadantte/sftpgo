@@ -45,7 +45,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
-	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
@@ -66,7 +65,7 @@ const (
 
 var (
 	s3DirMimeTypes    = []string{s3DirMimeType, "httpd/unix-directory"}
-	s3DefaultPageSize = int32(5000)
+	s3DefaultPageSize = int32(1000)
 )
 
 // S3Fs is a Fs implementation for AWS S3 compatible object storages
@@ -227,53 +226,29 @@ func (fs *S3Fs) Lstat(name string) (os.FileInfo, error) {
 
 // Open opens the named file for reading
 func (fs *S3Fs) Open(name string, offset int64) (File, PipeReader, func(), error) {
+	attrs, err := fs.headObject(name)
+	if err != nil {
+		return nil, nil, nil, err
+	}
 	r, w, err := createPipeFn(fs.localTempDir, fs.config.DownloadPartSize*int64(fs.config.DownloadConcurrency)+1)
 	if err != nil {
 		return nil, nil, nil, err
 	}
 	p := NewPipeReader(r)
 	if readMetadata > 0 {
-		attrs, err := fs.headObject(name)
-		if err != nil {
-			r.Close()
-			w.Close()
-			return nil, nil, nil, err
-		}
 		p.setMetadata(attrs.Metadata)
 	}
-
 	ctx, cancelFn := context.WithCancel(context.Background())
-	downloader := manager.NewDownloader(fs.svc, func(d *manager.Downloader) {
-		d.Concurrency = fs.config.DownloadConcurrency
-		d.PartSize = fs.config.DownloadPartSize
-		if offset == 0 && fs.config.DownloadPartMaxTime > 0 {
-			d.ClientOptions = append(d.ClientOptions, func(o *s3.Options) {
-				o.HTTPClient = getAWSHTTPClient(fs.config.DownloadPartMaxTime, 100*time.Millisecond,
-					fs.config.SkipTLSVerify)
-			})
-		}
-	})
-
-	var streamRange *string
-	if offset > 0 {
-		streamRange = aws.String(fmt.Sprintf("bytes=%d-", offset))
-	}
 
 	go func() {
 		defer cancelFn()
 
-		n, err := downloader.Download(ctx, w, &s3.GetObjectInput{
-			Bucket:               aws.String(fs.config.Bucket),
-			Key:                  aws.String(name),
-			Range:                streamRange,
-			SSECustomerKey:       util.NilIfEmpty(fs.sseCustomerKey),
-			SSECustomerAlgorithm: util.NilIfEmpty(fs.sseCustomerAlgo),
-			SSECustomerKeyMD5:    util.NilIfEmpty(fs.sseCustomerKeyMD5),
-		})
-		w.CloseWithError(err) //nolint:errcheck
-		fsLog(fs, logger.LevelDebug, "download completed, path: %q size: %v, err: %+v", name, n, err)
-		metric.S3TransferCompleted(n, 1, err)
+		err := fs.handleDownload(ctx, name, offset, w, attrs)
+		w.CloseWithError(err)
+		fsLog(fs, logger.LevelDebug, "download completed, path: %q size: %d, err: %+v", name, w.GetWrittenBytes(), err)
+		metric.S3TransferCompleted(w.GetWrittenBytes(), 1, err)
 	}()
+
 	return nil, p, cancelFn, nil
 }
 
@@ -307,7 +282,7 @@ func (fs *S3Fs) Create(name string, flag, checks int) (File, PipeWriter, func(),
 			contentType = mime.TypeByExtension(path.Ext(name))
 		}
 		err := fs.handleUpload(ctx, r, name, contentType)
-		r.CloseWithError(err) //nolint:errcheck
+		r.CloseWithError(err)
 		p.Done(err)
 		fsLog(fs, logger.LevelDebug, "upload completed, path: %q, acl: %q, readed bytes: %d, err: %+v",
 			name, fs.config.ACL, r.GetReadedBytes(), err)
@@ -342,6 +317,20 @@ func (fs *S3Fs) Create(name string, flag, checks int) (File, PipeWriter, func(),
 
 // Rename renames (moves) source to target.
 func (fs *S3Fs) Rename(source, target string, checks int) (int, int64, error) {
+	return fs.renameChecked(source, target, checks, nil)
+}
+
+// CanCheckRenamedEntries implements the FsCheckedRenamer interface
+func (*S3Fs) CanCheckRenamedEntries() bool {
+	return true
+}
+
+// RenameChecked implements the FsCheckedRenamer interface
+func (fs *S3Fs) RenameChecked(source, target string, checks int, onEntry EntryCheckFn) (int, int64, error) {
+	return fs.renameChecked(source, target, checks, onEntry)
+}
+
+func (fs *S3Fs) renameChecked(source, target string, checks int, onEntry EntryCheckFn) (int, int64, error) {
 	if source == target {
 		return -1, -1, nil
 	}
@@ -355,7 +344,7 @@ func (fs *S3Fs) Rename(source, target string, checks int) (int, int64, error) {
 	if err != nil {
 		return -1, -1, err
 	}
-	return fs.renameInternal(source, target, fi, 0, checks&CheckUpdateModTime != 0)
+	return fs.renameInternal(source, target, fi, onEntry, 0, checks&CheckUpdateModTime != 0)
 }
 
 // Remove removes the named file or (empty) directory.
@@ -470,8 +459,7 @@ func (*S3Fs) IsNotExist(err error) bool {
 		return false
 	}
 
-	var re *awshttp.ResponseError
-	if errors.As(err, &re) {
+	if re, ok := errors.AsType[*awshttp.ResponseError](err); ok {
 		if re.Response != nil {
 			return re.Response.StatusCode == http.StatusNotFound
 		}
@@ -486,8 +474,7 @@ func (*S3Fs) IsPermission(err error) bool {
 		return false
 	}
 
-	var re *awshttp.ResponseError
-	if errors.As(err, &re) {
+	if re, ok := errors.AsType[*awshttp.ResponseError](err); ok {
 		if re.Response != nil {
 			return re.Response.StatusCode == http.StatusForbidden ||
 				re.Response.StatusCode == http.StatusUnauthorized
@@ -508,6 +495,8 @@ func (*S3Fs) IsNotSupported(err error) bool {
 func (fs *S3Fs) CheckRootPath(username string, uid int, gid int) bool {
 	// we need a local directory for temporary files
 	osFs := NewOsFs(fs.ConnectionID(), fs.localTempDir, "", nil)
+	defer osFs.Close()
+
 	return osFs.CheckRootPath(username, uid, gid)
 }
 
@@ -601,7 +590,7 @@ func (fs *S3Fs) Walk(root string, walkFn filepath.WalkFunc) error {
 		page, err := paginator.NextPage(ctx)
 		if err != nil {
 			metric.S3ListObjectsCompleted(err)
-			walkFn(root, NewFileInfo(root, true, 0, time.Unix(0, 0), false), err) //nolint:errcheck
+			_ = walkFn(root, NewFileInfo(root, true, 0, time.Unix(0, 0), false), err)
 			return err
 		}
 		for _, fileObject := range page.Contents {
@@ -619,7 +608,7 @@ func (fs *S3Fs) Walk(root string, walkFn filepath.WalkFunc) error {
 	}
 
 	metric.S3ListObjectsCompleted(nil)
-	walkFn(root, NewFileInfo(root, true, 0, time.Unix(0, 0), false), nil) //nolint:errcheck
+	_ = walkFn(root, NewFileInfo(root, true, 0, time.Unix(0, 0), false), nil)
 	return nil
 }
 
@@ -636,11 +625,11 @@ func (*S3Fs) HasVirtualFolders() bool {
 // ResolvePath returns the matching filesystem path for the specified virtual path
 func (fs *S3Fs) ResolvePath(virtualPath string) (string, error) {
 	if fs.mountPath != "" {
-		virtualPath = strings.TrimPrefix(virtualPath, fs.mountPath)
+		if after, found := strings.CutPrefix(virtualPath, fs.mountPath); found {
+			virtualPath = after
+		}
 	}
-	if !path.IsAbs(virtualPath) {
-		virtualPath = path.Clean("/" + virtualPath)
-	}
+	virtualPath = path.Clean("/" + virtualPath)
 	return fs.Join(fs.config.KeyPrefix, strings.TrimPrefix(virtualPath, "/")), nil
 }
 
@@ -673,25 +662,28 @@ func (fs *S3Fs) resolve(name *string, prefix string) (string, bool) {
 }
 
 func (fs *S3Fs) setConfigDefaults() {
+	const defaultPartSize = 1024 * 1024 * 5
+	const defaultConcurrency = 5
+
 	if fs.config.UploadPartSize == 0 {
-		fs.config.UploadPartSize = manager.DefaultUploadPartSize
+		fs.config.UploadPartSize = defaultPartSize
 	} else {
 		if fs.config.UploadPartSize < 1024*1024 {
 			fs.config.UploadPartSize *= 1024 * 1024
 		}
 	}
 	if fs.config.UploadConcurrency == 0 {
-		fs.config.UploadConcurrency = manager.DefaultUploadConcurrency
+		fs.config.UploadConcurrency = defaultConcurrency
 	}
 	if fs.config.DownloadPartSize == 0 {
-		fs.config.DownloadPartSize = manager.DefaultDownloadPartSize
+		fs.config.DownloadPartSize = defaultPartSize
 	} else {
 		if fs.config.DownloadPartSize < 1024*1024 {
 			fs.config.DownloadPartSize *= 1024 * 1024
 		}
 	}
 	if fs.config.DownloadConcurrency == 0 {
-		fs.config.DownloadConcurrency = manager.DefaultDownloadConcurrency
+		fs.config.DownloadConcurrency = defaultConcurrency
 	}
 }
 
@@ -730,8 +722,8 @@ func (fs *S3Fs) copyFileInternal(source, target string, srcInfo os.FileInfo) err
 	return err
 }
 
-func (fs *S3Fs) renameInternal(source, target string, srcInfo os.FileInfo, recursion int,
-	updateModTime bool,
+func (fs *S3Fs) renameInternal(source, target string, srcInfo os.FileInfo,
+	onEntry EntryCheckFn, recursion int, updateModTime bool,
 ) (int, int64, error) {
 	var numFiles int
 	var filesSize int64
@@ -750,7 +742,7 @@ func (fs *S3Fs) renameInternal(source, target string, srcInfo os.FileInfo, recur
 			return numFiles, filesSize, err
 		}
 		if renameMode == 1 {
-			files, size, err := doRecursiveRename(fs, source, target, fs.renameInternal, recursion, updateModTime)
+			files, size, err := doRecursiveRename(fs, source, target, fs.renameInternal, onEntry, recursion, updateModTime)
 			numFiles += files
 			filesSize += size
 			if err != nil {
@@ -767,6 +759,10 @@ func (fs *S3Fs) renameInternal(source, target string, srcInfo os.FileInfo, recur
 	err := fs.Remove(source, srcInfo.IsDir())
 	if fs.IsNotExist(err) {
 		err = nil
+	}
+	if err != nil && !srcInfo.IsDir() {
+		numFiles--
+		filesSize -= srcInfo.Size()
 	}
 	return numFiles, filesSize, err
 }
@@ -815,6 +811,111 @@ func (fs *S3Fs) hasContents(name string) (bool, error) {
 	return false, nil
 }
 
+func (fs *S3Fs) downloadPart(ctx context.Context, name string, buf []byte, w io.WriterAt, start, count, writeOffset int64) error {
+	if count == 0 {
+		return nil
+	}
+	rangeHeader := fmt.Sprintf("bytes=%d-%d", start, start+count-1)
+
+	resp, err := fs.svc.GetObject(ctx, &s3.GetObjectInput{
+		Bucket:               aws.String(fs.config.Bucket),
+		Key:                  aws.String(name),
+		Range:                &rangeHeader,
+		SSECustomerKey:       util.NilIfEmpty(fs.sseCustomerKey),
+		SSECustomerAlgorithm: util.NilIfEmpty(fs.sseCustomerAlgo),
+		SSECustomerKeyMD5:    util.NilIfEmpty(fs.sseCustomerKeyMD5),
+	})
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	_, err = io.ReadAtLeast(resp.Body, buf, int(count))
+	if err != nil {
+		return err
+	}
+
+	return writeAtFull(w, buf, writeOffset, int(count))
+}
+
+func (fs *S3Fs) handleDownload(ctx context.Context, name string, offset int64, writer io.WriterAt, attrs *s3.HeadObjectOutput) error {
+	contentLength := util.GetIntFromPointer(attrs.ContentLength)
+	sizeToDownload := contentLength - offset
+	if sizeToDownload < 0 {
+		fsLog(fs, logger.LevelError, "invalid multipart download size or offset, size: %d, offset: %d, size to download: %d",
+			contentLength, offset, sizeToDownload)
+		return errors.New("the requested offset exceeds the file size")
+	}
+	if sizeToDownload == 0 {
+		fsLog(fs, logger.LevelDebug, "nothing to download, offset %d, content length %d", offset, contentLength)
+		return nil
+	}
+	partSize := fs.config.DownloadPartSize
+	guard := make(chan struct{}, fs.config.DownloadConcurrency)
+	var blockCtxTimeout time.Duration
+	if fs.config.DownloadPartMaxTime > 0 {
+		blockCtxTimeout = time.Duration(fs.config.DownloadPartMaxTime) * time.Second
+	} else {
+		blockCtxTimeout = time.Duration(fs.config.DownloadPartSize/(1024*1024)) * time.Minute
+	}
+	pool := newBufferAllocator(int(partSize))
+	defer pool.free()
+
+	finished := false
+	var wg sync.WaitGroup
+	var errOnce sync.Once
+	var hasError atomic.Bool
+	var poolError error
+
+	poolCtx, poolCancel := context.WithCancel(ctx)
+	defer poolCancel()
+
+	for part := 0; !finished; part++ {
+		start := offset
+		end := offset + partSize
+		if end >= contentLength {
+			end = contentLength
+			finished = true
+		}
+		writeOffset := int64(part) * partSize
+		offset = end
+
+		guard <- struct{}{}
+		if hasError.Load() {
+			fsLog(fs, logger.LevelDebug, "pool error, download for part %d not started", part)
+			break
+		}
+
+		buf := pool.getBuffer()
+		wg.Add(1)
+		go func(start, end, writeOffset int64, buf []byte) {
+			defer func() {
+				pool.releaseBuffer(buf)
+				<-guard
+				wg.Done()
+			}()
+
+			innerCtx, cancelFn := context.WithDeadline(poolCtx, time.Now().Add(blockCtxTimeout))
+			defer cancelFn()
+
+			err := fs.downloadPart(innerCtx, name, buf, writer, start, end-start, writeOffset)
+			if err != nil {
+				errOnce.Do(func() {
+					fsLog(fs, logger.LevelError, "multipart download error: %+v", err)
+					hasError.Store(true)
+					poolError = fmt.Errorf("multipart download error: %w", err)
+					poolCancel()
+				})
+			}
+		}(start, end, writeOffset, buf)
+	}
+
+	wg.Wait()
+	close(guard)
+
+	return poolError
+}
+
 func (fs *S3Fs) initiateMultipartUpload(ctx context.Context, name, contentType string) (string, error) {
 	ctx, cancelFn := context.WithDeadline(ctx, time.Now().Add(fs.ctxTimeout))
 	defer cancelFn()
@@ -842,7 +943,7 @@ func (fs *S3Fs) initiateMultipartUpload(ctx context.Context, name, contentType s
 func (fs *S3Fs) uploadPart(ctx context.Context, name, uploadID string, partNumber int32, data []byte) (*string, error) {
 	timeout := time.Duration(fs.config.UploadPartSize/(1024*1024)) * time.Minute
 	if fs.config.UploadPartMaxTime > 0 {
-		timeout = time.Duration(fs.config.UploadPartMaxTime)
+		timeout = time.Duration(fs.config.UploadPartMaxTime) * time.Second
 	}
 	ctx, cancelFn := context.WithDeadline(ctx, time.Now().Add(timeout))
 	defer cancelFn()
@@ -891,6 +992,13 @@ func (fs *S3Fs) abortMultipartUpload(name, uploadID string) error {
 }
 
 func (fs *S3Fs) singlePartUpload(ctx context.Context, name, contentType string, data []byte) error {
+	timeout := time.Duration(fs.config.UploadPartSize/(1024*1024)) * time.Minute
+	if fs.config.UploadPartMaxTime > 0 {
+		timeout = time.Duration(fs.config.UploadPartMaxTime) * time.Second
+	}
+	ctx, cancelFn := context.WithDeadline(ctx, time.Now().Add(timeout))
+	defer cancelFn()
+
 	contentLength := int64(len(data))
 	_, err := fs.svc.PutObject(ctx, &s3.PutObjectInput{
 		Bucket:               aws.String(fs.config.Bucket),
@@ -990,7 +1098,7 @@ func (fs *S3Fs) handleUpload(ctx context.Context, reader io.Reader, name, conten
 			errOnce.Do(func() {
 				finalizeFailedUpload(err)
 			})
-			return err
+			break
 		}
 		guard <- struct{}{}
 		if hasError.Load() {
@@ -1208,31 +1316,18 @@ func (*S3Fs) GetAvailableDiskSize(_ string) (*sftp.StatVFS, error) {
 
 func (fs *S3Fs) downloadToWriter(name string, w PipeWriter) (int64, error) {
 	fsLog(fs, logger.LevelDebug, "starting download before resuming upload, path %q", name)
+	attrs, err := fs.headObject(name)
+	if err != nil {
+		return 0, err
+	}
 	ctx, cancelFn := context.WithTimeout(context.Background(), preResumeTimeout)
 	defer cancelFn()
 
-	downloader := manager.NewDownloader(fs.svc, func(d *manager.Downloader) {
-		d.Concurrency = fs.config.DownloadConcurrency
-		d.PartSize = fs.config.DownloadPartSize
-		if fs.config.DownloadPartMaxTime > 0 {
-			d.ClientOptions = append(d.ClientOptions, func(o *s3.Options) {
-				o.HTTPClient = getAWSHTTPClient(fs.config.DownloadPartMaxTime, 100*time.Millisecond,
-					fs.config.SkipTLSVerify)
-			})
-		}
-	})
-
-	n, err := downloader.Download(ctx, w, &s3.GetObjectInput{
-		Bucket:               aws.String(fs.config.Bucket),
-		Key:                  aws.String(name),
-		SSECustomerKey:       util.NilIfEmpty(fs.sseCustomerKey),
-		SSECustomerAlgorithm: util.NilIfEmpty(fs.sseCustomerAlgo),
-		SSECustomerKeyMD5:    util.NilIfEmpty(fs.sseCustomerKeyMD5),
-	})
+	err = fs.handleDownload(ctx, name, 0, w, attrs)
 	fsLog(fs, logger.LevelDebug, "download before resuming upload completed, path %q size: %d, err: %+v",
-		name, n, err)
-	metric.S3TransferCompleted(n, 1, err)
-	return n, err
+		name, w.GetWrittenBytes(), err)
+	metric.S3TransferCompleted(w.GetWrittenBytes(), 1, err)
+	return w.GetWrittenBytes(), err
 }
 
 type s3DirLister struct {

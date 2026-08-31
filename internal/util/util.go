@@ -23,6 +23,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
@@ -30,6 +31,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"io/fs"
 	"math"
@@ -42,7 +44,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
-	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -130,10 +131,33 @@ var bytesSizeTable = map[string]uint64{
 	"e":  eByte,
 }
 
+// sanitizeCSVField neutralizes leading characters that spreadsheet
+// applications interpret as the start of a formula, mitigating CSV
+// formula injection when exporting user-controlled data.
+func sanitizeCSVField(s string) string {
+	if s == "" {
+		return s
+	}
+	switch s[0] {
+	case '=', '+', '-', '@', '\t', '\r':
+		return "'" + s
+	}
+	return s
+}
+
+// SanitizeCSVRow neutralizes spreadsheet formula triggers in each value of
+// row, in place, and returns it for convenience.
+func SanitizeCSVRow(row []string) []string {
+	for i := range row {
+		row[i] = sanitizeCSVField(row[i])
+	}
+	return row
+}
+
 // IsStringPrefixInSlice searches a string prefix in a slice and returns true
 // if a matching prefix is found
 func IsStringPrefixInSlice(obj string, list []string) bool {
-	for i := 0; i < len(list); i++ {
+	for i := range list {
 		if strings.HasPrefix(obj, list[i]) {
 			return true
 		}
@@ -159,6 +183,53 @@ func RemoveDuplicates(obj []string, trim bool) []string {
 		}
 	}
 	return obj[:validIdx]
+}
+
+// IsNameValid validates that a name/username contains only safe characters.
+// Since names can be used within filesystem paths, only a restricted character
+// set is permitted. Unicode control (Cc), format (Cf) and line/paragraph
+// separator (Zl/Zp) characters, including zero-width, bidirectional and
+// newline-like codepoints, are rejected to prevent invisible, visually
+// confusable names and log injection.
+func IsNameValid(name string) bool {
+	if name == "" {
+		return false
+	}
+	if len(name) > 255 {
+		return false
+	}
+	for _, r := range name {
+		if unicode.IsControl(r) || unicode.In(r, unicode.Cf, unicode.Zl, unicode.Zp) {
+			return false
+		}
+
+		switch r {
+		case '/', '\\':
+			return false
+		case ':', '*', '?', '"', '<', '>', '|':
+			return false
+		}
+	}
+
+	if name == "." || name == ".." {
+		return false
+	}
+
+	upperName := strings.ToUpper(name)
+	baseName, _, _ := strings.Cut(upperName, ".")
+
+	switch baseName {
+	case "CON", "PRN", "AUX", "NUL",
+		"COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+		"LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9":
+		return false
+	}
+
+	if strings.HasSuffix(name, " ") || strings.HasSuffix(name, ".") {
+		return false
+	}
+
+	return true
 }
 
 // GetTimeAsMsSinceEpoch returns unix timestamp as milliseconds from a time struct
@@ -504,7 +575,7 @@ func CleanPath(p string) string {
 // CleanPathWithBase returns a clean POSIX (/) absolute path to work with.
 // The specified base will be used if the provided path is not absolute
 func CleanPathWithBase(base, p string) string {
-	p = filepath.ToSlash(p)
+	p = strings.ReplaceAll(p, "\\", "/")
 	if !path.IsAbs(p) {
 		p = path.Join(base, p)
 	}
@@ -592,8 +663,8 @@ func HTTPListenAndServe(srv *http.Server, address string, port int, isTLS bool,
 			logger.ErrorToConsole("error creating Unix-domain socket parent dir: %v", err)
 			logger.Error(logSender, "", "error creating Unix-domain socket parent dir: %v", err)
 		}
-		os.Remove(address)
-		listener, err = newListener("unix", address, srv.ReadTimeout, srv.WriteTimeout)
+		_ = os.Remove(address)
+		listener, err = net.Listen("unix", address)
 		if err == nil {
 			// should a chmod err be fatal?
 			if errChmod := os.Chmod(address, 0770); errChmod != nil {
@@ -602,7 +673,7 @@ func HTTPListenAndServe(srv *http.Server, address string, port int, isTLS bool,
 		}
 	} else {
 		CheckTCP4Port(port)
-		listener, err = newListener("tcp", fmt.Sprintf("%s:%d", address, port), srv.ReadTimeout, srv.WriteTimeout)
+		listener, err = net.Listen("tcp", fmt.Sprintf("%s:%d", address, port))
 	}
 	if err != nil {
 		return err
@@ -675,7 +746,7 @@ func EncodeTLSCertToPem(tlsCert *x509.Certificate) (string, error) {
 		Type:  "CERTIFICATE",
 		Bytes: tlsCert.Raw,
 	}
-	return BytesToString(pem.EncodeToMemory(&publicKeyBlock)), nil
+	return string(pem.EncodeToMemory(&publicKeyBlock)), nil
 }
 
 // CheckTCP4Port quits the app if bind on the given IPv4 port fails.
@@ -719,7 +790,7 @@ func GetSSHPublicKeyAsString(pubKey []byte) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return BytesToString(ssh.MarshalAuthorizedKey(k)), nil
+	return string(ssh.MarshalAuthorizedKey(k)), nil
 }
 
 // GetRealIP returns the ip address as result of parsing the specified
@@ -892,7 +963,7 @@ func JSONEscape(val string) string {
 	if err != nil {
 		return ""
 	}
-	return BytesToString(b[1 : len(b)-1])
+	return string(b[1 : len(b)-1])
 }
 
 // ReadConfigFromFile reads a configuration parameter from the specified file
@@ -913,7 +984,19 @@ func ReadConfigFromFile(name, configDir string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return strings.TrimSpace(BytesToString(val)), nil
+	return strings.TrimSpace(string(val)), nil
+}
+
+// ResolveConfigValue returns the content of the file at filePath if filePath
+// is non-empty, otherwise it returns value unchanged. This is typically used
+// to allow sensitive configuration values (passwords, secrets) to be loaded
+// from a file (e.g. a Docker/Kubernetes secret mount) instead of being
+// provided inline.
+func ResolveConfigValue(value, filePath, configDir string) (string, error) {
+	if filePath == "" {
+		return value, nil
+	}
+	return ReadConfigFromFile(filePath, configDir)
 }
 
 // SlicesEqual checks if the provided slices contain the same elements,
@@ -922,11 +1005,55 @@ func SlicesEqual(s1, s2 []string) bool {
 	if len(s1) != len(s2) {
 		return false
 	}
+
+	counts := make(map[string]int)
 	for _, v := range s1 {
-		if !slices.Contains(s2, v) {
+		counts[v]++
+	}
+
+	for _, v := range s2 {
+		counts[v]--
+		if counts[v] < 0 {
 			return false
 		}
 	}
 
 	return true
+}
+
+// VerifyFileChecksum computes the hash of the given file using the provided
+// hash algorithm and compares it against the expected checksum (in hex format).
+// It returns an error if the checksum does not match or if the operation fails.
+func VerifyFileChecksum(filePath string, h hash.Hash, expectedHex string, maxSize int64) error {
+	expected, err := hex.DecodeString(expectedHex)
+	if err != nil {
+		return fmt.Errorf("invalid checksum %q: %w", expectedHex, err)
+	}
+
+	f, err := os.Open(filePath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	if maxSize > 0 {
+		fi, err := f.Stat()
+		if err != nil {
+			return err
+		}
+		if fi.Size() > maxSize {
+			return fmt.Errorf("file too large: %s", ByteCountIEC(fi.Size()))
+		}
+	}
+
+	if _, err := io.Copy(h, f); err != nil {
+		return err
+	}
+
+	actual := h.Sum(nil)
+	if subtle.ConstantTimeCompare(actual, expected) != 1 {
+		return errors.New("checksum mismatch")
+	}
+
+	return nil
 }

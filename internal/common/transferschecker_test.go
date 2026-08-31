@@ -103,6 +103,7 @@ func TestTransfersCheckerDiskQuota(t *testing.T) {
 	transfer1.BytesReceived.Store(150)
 	err = Connections.Add(fakeConn1)
 	assert.NoError(t, err)
+	waitForCheckerTransfers(t, 1)
 	// the transferschecker will do nothing if there is only one ongoing transfer
 	Connections.checkTransfers()
 	assert.Nil(t, transfer1.errAbort)
@@ -118,6 +119,7 @@ func TestTransfersCheckerDiskQuota(t *testing.T) {
 	transfer2.BytesReceived.Store(60)
 	err = Connections.Add(fakeConn2)
 	assert.NoError(t, err)
+	waitForCheckerTransfers(t, 2)
 
 	connID3 := xid.New().String()
 	conn3 := NewBaseConnection(connID3, ProtocolSFTP, "", "", user)
@@ -129,6 +131,7 @@ func TestTransfersCheckerDiskQuota(t *testing.T) {
 	transfer3.BytesReceived.Store(60) // this value will be ignored, this is a download
 	err = Connections.Add(fakeConn3)
 	assert.NoError(t, err)
+	waitForCheckerTransfers(t, 3)
 
 	// the transfers are not overquota
 	Connections.checkTransfers()
@@ -201,6 +204,7 @@ func TestTransfersCheckerDiskQuota(t *testing.T) {
 
 	err = Connections.Add(fakeConn5)
 	assert.NoError(t, err)
+	waitForCheckerTransfers(t, 5)
 	transfer4.BytesReceived.Store(50)
 	transfer5.BytesReceived.Store(40)
 	Connections.checkTransfers()
@@ -248,6 +252,7 @@ func TestTransfersCheckerDiskQuota(t *testing.T) {
 	Connections.Remove(fakeConn3.GetID())
 	Connections.Remove(fakeConn4.GetID())
 	Connections.Remove(fakeConn5.GetID())
+	waitForCheckerTransfers(t, 0)
 	stats := Connections.GetStats("")
 	assert.Len(t, stats, 0)
 	assert.Equal(t, int32(0), Connections.GetTotalTransfers())
@@ -294,6 +299,7 @@ func TestTransferCheckerTransferQuota(t *testing.T) {
 	transfer1.BytesReceived.Store(150)
 	err = Connections.Add(fakeConn1)
 	assert.NoError(t, err)
+	waitForCheckerTransfers(t, 1)
 	// the transferschecker will do nothing if there is only one ongoing transfer
 	Connections.checkTransfers()
 	assert.Nil(t, transfer1.errAbort)
@@ -308,6 +314,7 @@ func TestTransferCheckerTransferQuota(t *testing.T) {
 	transfer2.BytesReceived.Store(150)
 	err = Connections.Add(fakeConn2)
 	assert.NoError(t, err)
+	waitForCheckerTransfers(t, 2)
 	Connections.checkTransfers()
 	assert.Nil(t, transfer1.errAbort)
 	assert.Nil(t, transfer2.errAbort)
@@ -334,6 +341,7 @@ func TestTransferCheckerTransferQuota(t *testing.T) {
 	assert.NoError(t, err)
 	Connections.Remove(fakeConn1.GetID())
 	Connections.Remove(fakeConn2.GetID())
+	waitForCheckerTransfers(t, 0)
 
 	connID3 := xid.New().String()
 	conn3 := NewBaseConnection(connID3, ProtocolSFTP, "", "", user)
@@ -356,6 +364,7 @@ func TestTransferCheckerTransferQuota(t *testing.T) {
 	transfer4.BytesSent.Store(150)
 	err = Connections.Add(fakeConn4)
 	assert.NoError(t, err)
+	waitForCheckerTransfers(t, 2)
 	Connections.checkTransfers()
 	assert.Nil(t, transfer3.errAbort)
 	assert.Nil(t, transfer4.errAbort)
@@ -376,6 +385,7 @@ func TestTransferCheckerTransferQuota(t *testing.T) {
 
 	Connections.Remove(fakeConn3.GetID())
 	Connections.Remove(fakeConn4.GetID())
+	waitForCheckerTransfers(t, 0)
 	stats := Connections.GetStats("")
 	assert.Len(t, stats, 0)
 	assert.Equal(t, int32(0), Connections.GetTotalTransfers())
@@ -603,7 +613,7 @@ func TestDataTransferExceeded(t *testing.T) {
 
 func TestGetUsersForQuotaCheck(t *testing.T) {
 	usersToFetch := make(map[string]bool)
-	for i := 0; i < 70; i++ {
+	for i := range 70 {
 		usersToFetch[fmt.Sprintf("user%v", i)] = i%2 == 0
 	}
 
@@ -611,7 +621,7 @@ func TestGetUsersForQuotaCheck(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Len(t, users, 0)
 
-	for i := 0; i < 60; i++ {
+	for i := range 60 {
 		folder := vfs.BaseVirtualFolder{
 			Name:       fmt.Sprintf("f%v", i),
 			MappedPath: filepath.Join(os.TempDir(), fmt.Sprintf("f%v", i)),
@@ -671,7 +681,7 @@ func TestGetUsersForQuotaCheck(t *testing.T) {
 		assert.Equal(t, int64(0), total)
 	}
 
-	for i := 0; i < 60; i++ {
+	for i := range 60 {
 		err = dataprovider.DeleteUser(fmt.Sprintf("user%v", i), "", "", "")
 		assert.NoError(t, err)
 		err = dataprovider.DeleteFolder(fmt.Sprintf("f%v", i), "", "", "")
@@ -753,6 +763,107 @@ func TestDBTransferChecker(t *testing.T) {
 	providerConf.IsShared = 0
 	err = dataprovider.Initialize(providerConf, configDir, true)
 	assert.NoError(t, err)
+}
+
+func TestTransfersCheckerSharedSingleTransfer(t *testing.T) {
+	if !isDbTransferCheckerSupported() {
+		t.Skip("this test is not supported with the current database provider")
+	}
+	providerConf := dataprovider.GetProviderConfig()
+	err := dataprovider.Close()
+	assert.NoError(t, err)
+	providerConf.IsShared = 1
+	err = dataprovider.Initialize(providerConf, configDir, true)
+	assert.NoError(t, err)
+
+	oldChecker := transfersChecker
+	transfersChecker = getTransfersChecker(1)
+	defer func() {
+		transfersChecker = oldChecker
+		err := dataprovider.Close()
+		assert.NoError(t, err)
+		providerConf.IsShared = 0
+		err = dataprovider.Initialize(providerConf, configDir, true)
+		assert.NoError(t, err)
+	}()
+
+	username := "user_shared_check"
+	user := dataprovider.User{
+		BaseUser: sdk.BaseUser{
+			Username:  username,
+			HomeDir:   filepath.Join(os.TempDir(), username),
+			Status:    1,
+			QuotaSize: 100,
+			Permissions: map[string][]string{
+				"/": {dataprovider.PermAny},
+			},
+		},
+	}
+	err = dataprovider.AddUser(&user, "", "", "")
+	assert.NoError(t, err)
+	user, err = dataprovider.GetUserWithGroupSettings(username, "")
+	assert.NoError(t, err)
+
+	// simulate an in-flight upload on another cluster node, already close to the quota
+	remoteTransfer := dataprovider.ActiveTransfer{
+		ID:            1,
+		Type:          TransferUpload,
+		ConnID:        xid.New().String(),
+		Username:      username,
+		IP:            "127.0.0.1",
+		CurrentULSize: 80,
+	}
+	dataprovider.AddActiveTransfer(remoteTransfer)
+
+	// a single local connection/transfer on this node
+	connID := xid.New().String()
+	fsUser, err := user.GetFilesystemForPath("/file1", connID)
+	assert.NoError(t, err)
+	conn := NewBaseConnection(connID, ProtocolSFTP, "", "", user)
+	fakeConn := &fakeConnection{BaseConnection: conn}
+	transfer := NewBaseTransfer(nil, conn, nil, filepath.Join(user.HomeDir, "file1"),
+		filepath.Join(user.HomeDir, "file1"), "/file1", TransferUpload, 0, 0, 1000, 0, true,
+		fsUser, dataprovider.TransferQuota{})
+	transfer.BytesReceived.Store(80)
+	err = Connections.Add(fakeConn)
+	assert.NoError(t, err)
+
+	// wait for the async DB insert of the local transfer
+	assert.Eventually(t, func() bool {
+		transfers, err := dataprovider.GetActiveTransfers(time.Now().Add(-periodicTimeoutCheckInterval * 2))
+		return err == nil && len(transfers) == 2
+	}, 2*time.Second, 50*time.Millisecond)
+
+	Connections.checkTransfers()
+	assert.True(t, conn.IsQuotaExceededError(transfer.GetAbortError()))
+
+	err = transfer.Close()
+	assert.NoError(t, err)
+	Connections.Remove(fakeConn.GetID())
+	dataprovider.RemoveActiveTransfer(remoteTransfer.ID, remoteTransfer.ConnID)
+
+	err = dataprovider.DeleteUser(username, "", "", "")
+	assert.NoError(t, err)
+	err = os.RemoveAll(user.GetHomeDir())
+	assert.NoError(t, err)
+}
+
+// waitForCheckerTransfers waits until the memory transfers checker tracks the expected
+// number of transfers. Transfers are added to and removed from the checker asynchronously,
+// callers must wait before invoking checkTransfers to get deterministic results
+func waitForCheckerTransfers(t *testing.T, expected int) {
+	t.Helper()
+
+	checker, ok := transfersChecker.(*transfersCheckerMem)
+	if !assert.True(t, ok, "unexpected transfers checker: %T", transfersChecker) {
+		return
+	}
+	assert.Eventually(t, func() bool {
+		checker.RLock()
+		defer checker.RUnlock()
+
+		return len(checker.transfers) == expected
+	}, 2*time.Second, 20*time.Millisecond, "the transfers checker does not track %d transfers", expected)
 }
 
 func isDbTransferCheckerSupported() bool {

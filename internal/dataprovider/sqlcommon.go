@@ -36,7 +36,7 @@ import (
 )
 
 const (
-	sqlDatabaseVersion     = 32
+	sqlDatabaseVersion     = 36
 	defaultSQLQueryTimeout = 10 * time.Second
 	longSQLQueryTimeout    = 60 * time.Second
 )
@@ -71,6 +71,7 @@ func sqlReplaceAll(sql string) string {
 	sql = strings.ReplaceAll(sql, "{{groups_folders_mapping}}", sqlTableGroupsFoldersMapping)
 	sql = strings.ReplaceAll(sql, "{{api_keys}}", sqlTableAPIKeys)
 	sql = strings.ReplaceAll(sql, "{{shares}}", sqlTableShares)
+	sql = strings.ReplaceAll(sql, "{{shares_groups_mapping}}", sqlTableSharesGroupsMapping)
 	sql = strings.ReplaceAll(sql, "{{defender_events}}", sqlTableDefenderEvents)
 	sql = strings.ReplaceAll(sql, "{{defender_hosts}}", sqlTableDefenderHosts)
 	sql = strings.ReplaceAll(sql, "{{active_transfers}}", sqlTableActiveTransfers)
@@ -85,6 +86,14 @@ func sqlReplaceAll(sql string) string {
 	sql = strings.ReplaceAll(sql, "{{configs}}", sqlTableConfigs)
 	sql = strings.ReplaceAll(sql, "{{prefix}}", config.SQLTablesPrefix)
 	return sql
+}
+
+func sqlReplaceAllList(statements []string) []string {
+	result := make([]string, 0, len(statements))
+	for _, q := range statements {
+		result = append(result, sqlReplaceAll(q))
+	}
+	return result
 }
 
 func sqlCommonGetShareByID(shareID, username string, dbHandle sqlQuerier) (Share, error) {
@@ -563,9 +572,8 @@ func sqlCommonDumpIPListEntries(dbHandle *sql.DB) ([]IPListEntry, error) {
 	if err != nil {
 		return nil, err
 	}
-	if count > ipListMemoryLimit {
-		providerLog(logger.LevelInfo, "IP lists excluded from dump, too many entries: %d", count)
-		return nil, nil
+	if count > ipListDumpLimit {
+		return nil, errTooManyIPListEntries(count)
 	}
 	entries := make([]IPListEntry, 0, 100)
 	ctx, cancel := context.WithTimeout(context.Background(), longSQLQueryTimeout)
@@ -1294,14 +1302,31 @@ func sqlCommonUpdateShareLastUse(shareID string, numTokens int, dbHandle *sql.DB
 	ctx, cancel := context.WithTimeout(context.Background(), defaultSQLQueryTimeout)
 	defer cancel()
 
-	q := getUpdateShareLastUseQuery()
-	_, err := dbHandle.ExecContext(ctx, q, util.GetTimeAsMsSinceEpoch(time.Now()), numTokens, shareID)
-	if err == nil {
-		providerLog(logger.LevelDebug, "last use updated for shared object %q", shareID)
-	} else {
-		providerLog(logger.LevelWarn, "error updating last use for shared object %q: %v", shareID, err)
+	if numTokens <= 0 {
+		q := getUpdateShareLastUseQuery()
+		_, err := dbHandle.ExecContext(ctx, q, util.GetTimeAsMsSinceEpoch(time.Now()), numTokens, shareID)
+		if err != nil {
+			providerLog(logger.LevelWarn, "error updating last use for shared object %q: %v", shareID, err)
+		}
+		return err
 	}
-	return err
+	q := getReserveShareTokensQuery()
+	res, err := dbHandle.ExecContext(ctx, q, util.GetTimeAsMsSinceEpoch(time.Now()), numTokens, shareID, numTokens)
+	if err != nil {
+		providerLog(logger.LevelWarn, "error reserving usage tokens for shared object %q: %v", shareID, err)
+		return err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		providerLog(logger.LevelWarn, "error getting affected rows reserving usage tokens for shared object %q: %v",
+			shareID, err)
+		return err
+	}
+	if rows == 0 {
+		return ErrShareUsageExceeded
+	}
+	providerLog(logger.LevelDebug, "usage tokens reserved for shared object %q", shareID)
+	return nil
 }
 
 func sqlCommonUpdateAPIKeyLastUse(keyID string, dbHandle *sql.DB) error {
@@ -1607,10 +1632,7 @@ func sqlCommonGetRecentlyUpdatedUsers(after int64, dbHandle sqlQuerier) ([]User,
 }
 
 func sqlGetMaxUsersForQuotaCheckRange() int {
-	maxUsers := 50
-	if maxUsers > len(sqlPlaceholders) {
-		maxUsers = len(sqlPlaceholders)
-	}
+	maxUsers := min(50, len(sqlPlaceholders))
 	return maxUsers
 }
 
@@ -2523,9 +2545,10 @@ func sqlCommonClearUserGroupMapping(ctx context.Context, user *User, dbHandle sq
 	return err
 }
 
-func sqlCommonAddUserFolderMapping(ctx context.Context, user *User, folder *vfs.VirtualFolder, dbHandle sqlQuerier) error {
+func sqlCommonAddUserFolderMapping(ctx context.Context, user *User, folder *vfs.VirtualFolder, sortOrder int, dbHandle sqlQuerier) error {
 	q := getAddUserFolderMappingQuery()
-	_, err := dbHandle.ExecContext(ctx, q, folder.VirtualPath, folder.QuotaSize, folder.QuotaFiles, folder.Name, user.Username)
+	_, err := dbHandle.ExecContext(ctx, q, folder.VirtualPath, folder.QuotaSize, folder.QuotaFiles, folder.Subpath,
+		folder.Name, user.Username, sortOrder)
 	return err
 }
 
@@ -2535,27 +2558,30 @@ func sqlCommonClearAdminGroupMapping(ctx context.Context, admin *Admin, dbHandle
 	return err
 }
 
-func sqlCommonAddGroupFolderMapping(ctx context.Context, group *Group, folder *vfs.VirtualFolder, dbHandle sqlQuerier) error {
+func sqlCommonAddGroupFolderMapping(ctx context.Context, group *Group, folder *vfs.VirtualFolder, sortOrder int,
+	dbHandle sqlQuerier,
+) error {
 	q := getAddGroupFolderMappingQuery()
-	_, err := dbHandle.ExecContext(ctx, q, folder.VirtualPath, folder.QuotaSize, folder.QuotaFiles, folder.Name, group.Name)
+	_, err := dbHandle.ExecContext(ctx, q, folder.VirtualPath, folder.QuotaSize, folder.QuotaFiles, folder.Subpath,
+		folder.Name, group.Name, sortOrder)
 	return err
 }
 
-func sqlCommonAddUserGroupMapping(ctx context.Context, username, groupName string, groupType int, dbHandle sqlQuerier) error {
+func sqlCommonAddUserGroupMapping(ctx context.Context, username, groupName string, groupType, sortOrder int, dbHandle sqlQuerier) error {
 	q := getAddUserGroupMappingQuery()
-	_, err := dbHandle.ExecContext(ctx, q, username, groupName, groupType)
+	_, err := dbHandle.ExecContext(ctx, q, username, groupName, groupType, sortOrder)
 	return err
 }
 
 func sqlCommonAddAdminGroupMapping(ctx context.Context, username, groupName string, mappingOptions AdminGroupMappingOptions,
-	dbHandle sqlQuerier,
+	sortOrder int, dbHandle sqlQuerier,
 ) error {
 	options, err := json.Marshal(mappingOptions)
 	if err != nil {
 		return err
 	}
 	q := getAddAdminGroupMappingQuery()
-	_, err = dbHandle.ExecContext(ctx, q, username, groupName, options)
+	_, err = dbHandle.ExecContext(ctx, q, username, groupName, options, sortOrder)
 	return err
 }
 
@@ -2566,7 +2592,7 @@ func generateGroupVirtualFoldersMapping(ctx context.Context, group *Group, dbHan
 	}
 	for idx := range group.VirtualFolders {
 		vfolder := &group.VirtualFolders[idx]
-		err = sqlCommonAddGroupFolderMapping(ctx, group, vfolder, dbHandle)
+		err = sqlCommonAddGroupFolderMapping(ctx, group, vfolder, idx, dbHandle)
 		if err != nil {
 			return err
 		}
@@ -2581,7 +2607,7 @@ func generateUserVirtualFoldersMapping(ctx context.Context, user *User, dbHandle
 	}
 	for idx := range user.VirtualFolders {
 		vfolder := &user.VirtualFolders[idx]
-		err = sqlCommonAddUserFolderMapping(ctx, user, vfolder, dbHandle)
+		err = sqlCommonAddUserFolderMapping(ctx, user, vfolder, idx, dbHandle)
 		if err != nil {
 			return err
 		}
@@ -2594,8 +2620,8 @@ func generateUserGroupMapping(ctx context.Context, user *User, dbHandle sqlQueri
 	if err != nil {
 		return err
 	}
-	for _, group := range user.Groups {
-		err = sqlCommonAddUserGroupMapping(ctx, user.Username, group.Name, group.Type, dbHandle)
+	for idx, group := range user.Groups {
+		err = sqlCommonAddUserGroupMapping(ctx, user.Username, group.Name, group.Type, idx, dbHandle)
 		if err != nil {
 			return err
 		}
@@ -2608,8 +2634,8 @@ func generateAdminGroupMapping(ctx context.Context, admin *Admin, dbHandle sqlQu
 	if err != nil {
 		return err
 	}
-	for _, group := range admin.Groups {
-		err = sqlCommonAddAdminGroupMapping(ctx, admin.Username, group.Name, group.Options, dbHandle)
+	for idx, group := range admin.Groups {
+		err = sqlCommonAddAdminGroupMapping(ctx, admin.Username, group.Name, group.Options, idx, dbHandle)
 		if err != nil {
 			return err
 		}
@@ -2745,8 +2771,8 @@ func getUsersWithVirtualFolders(ctx context.Context, users []User, dbHandle sqlQ
 		var mappedPath, description sql.NullString
 		var fsConfig []byte
 		err = rows.Scan(&folder.ID, &folder.Name, &mappedPath, &folder.UsedQuotaSize, &folder.UsedQuotaFiles,
-			&folder.LastQuotaUpdate, &folder.VirtualPath, &folder.QuotaSize, &folder.QuotaFiles, &userID, &fsConfig,
-			&description)
+			&folder.LastQuotaUpdate, &folder.VirtualPath, &folder.QuotaSize, &folder.QuotaFiles, &folder.Subpath,
+			&userID, &fsConfig, &description)
 		if err != nil {
 			return users, err
 		}
@@ -2896,8 +2922,8 @@ func getGroupsWithVirtualFolders(ctx context.Context, groups []Group, dbHandle s
 		var mappedPath, description sql.NullString
 		var fsConfig []byte
 		err = rows.Scan(&folder.ID, &folder.Name, &mappedPath, &folder.UsedQuotaSize, &folder.UsedQuotaFiles,
-			&folder.LastQuotaUpdate, &folder.VirtualPath, &folder.QuotaSize, &folder.QuotaFiles, &groupID, &fsConfig,
-			&description)
+			&folder.LastQuotaUpdate, &folder.VirtualPath, &folder.QuotaSize, &folder.QuotaFiles, &folder.Subpath,
+			&groupID, &fsConfig, &description)
 		if err != nil {
 			return groups, err
 		}
@@ -3963,16 +3989,32 @@ func sqlCommonUpdateDatabaseVersion(ctx context.Context, dbHandle sqlQuerier, ve
 }
 
 func sqlCommonExecSQLAndUpdateDBVersion(dbHandle *sql.DB, sqlQueries []string, newVersion int, isUp bool) error {
-	if err := sqlAcquireLock(dbHandle); err != nil {
-		return err
-	}
-	defer sqlReleaseLock(dbHandle)
+	return sqlCommonExecMigration(dbHandle, sqlQueries, newVersion, isUp, nil)
+}
 
+// sqlCommonExecMigration executes the given statements and records the new
+// schema version. isApplied, when set, reports whether a statement error means
+// that its effect is already in place: such statements are logged and skipped,
+// so a migration interrupted partway can be completed by running it again.
+func sqlCommonExecMigration(dbHandle *sql.DB, sqlQueries []string, newVersion int, isUp bool,
+	isApplied func(error) bool,
+) error {
 	ctx, cancel := context.WithTimeout(context.Background(), longSQLQueryTimeout)
 	defer cancel()
 
+	conn, err := dbHandle.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("unable to get connection from pool: %w", err)
+	}
+	defer conn.Close()
+
+	if err := sqlAcquireLock(conn); err != nil {
+		return err
+	}
+	defer sqlReleaseLock(conn)
+
 	if newVersion > 0 {
-		currentVersion, err := sqlCommonGetDatabaseVersion(dbHandle, false)
+		currentVersion, err := sqlCommonGetDatabaseVersion(conn, false)
 		if err == nil {
 			if (isUp && currentVersion.Version >= newVersion) || (!isUp && currentVersion.Version <= newVersion) {
 				providerLog(logger.LevelInfo, "current schema version: %v, requested: %v, did you execute simultaneous migrations?",
@@ -3982,14 +4024,17 @@ func sqlCommonExecSQLAndUpdateDBVersion(dbHandle *sql.DB, sqlQueries []string, n
 		}
 	}
 
-	return sqlCommonExecuteTx(ctx, dbHandle, func(tx *sql.Tx) error {
+	return sqlCommonExecuteTxOnConn(ctx, conn, func(tx *sql.Tx) error {
 		for _, q := range sqlQueries {
 			if strings.TrimSpace(q) == "" {
 				continue
 			}
 			_, err := tx.ExecContext(ctx, q)
 			if err != nil {
-				return err
+				if isApplied == nil || !isApplied(err) {
+					return err
+				}
+				providerLog(logger.LevelInfo, "skipping statement, already applied: %v", err)
 			}
 		}
 		if newVersion == 0 {
@@ -3999,7 +4044,7 @@ func sqlCommonExecSQLAndUpdateDBVersion(dbHandle *sql.DB, sqlQueries []string, n
 	})
 }
 
-func sqlAcquireLock(dbHandle *sql.DB) error {
+func sqlAcquireLock(dbHandle *sql.Conn) error {
 	ctx, cancel := context.WithTimeout(context.Background(), longSQLQueryTimeout)
 	defer cancel()
 
@@ -4028,7 +4073,7 @@ func sqlAcquireLock(dbHandle *sql.DB) error {
 	return nil
 }
 
-func sqlReleaseLock(dbHandle *sql.DB) {
+func sqlReleaseLock(dbHandle *sql.Conn) {
 	ctx, cancel := context.WithTimeout(context.Background(), defaultSQLQueryTimeout)
 	defer cancel()
 
@@ -4050,6 +4095,20 @@ func sqlReleaseLock(dbHandle *sql.DB) {
 	}
 }
 
+func sqlCommonExecuteTxOnConn(ctx context.Context, conn *sql.Conn, txFn func(*sql.Tx) error) error {
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+
+	err = txFn(tx)
+	if err != nil {
+		tx.Rollback()
+		return err
+	}
+	return tx.Commit()
+}
+
 func sqlCommonExecuteTx(ctx context.Context, dbHandle *sql.DB, txFn func(*sql.Tx) error) error {
 	if config.Driver == CockroachDataProviderName {
 		return crdb.ExecuteTx(ctx, dbHandle, nil, txFn)
@@ -4063,7 +4122,7 @@ func sqlCommonExecuteTx(ctx context.Context, dbHandle *sql.DB, txFn func(*sql.Tx
 	err = txFn(tx)
 	if err != nil {
 		// we don't change the returned error
-		tx.Rollback() //nolint:errcheck
+		tx.Rollback()
 		return err
 	}
 	return tx.Commit()

@@ -19,10 +19,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	ftpserver "github.com/fclairamb/ftpserverlib"
@@ -38,8 +42,9 @@ const (
 )
 
 var (
-	certMgr       *common.CertManager
-	serviceStatus ServiceStatus
+	certMgr         atomic.Pointer[common.CertManager]
+	serviceStatus   ServiceStatus
+	serviceStatusMu sync.RWMutex
 )
 
 // PassiveIPOverride defines an exception for the configured passive IP
@@ -66,8 +71,6 @@ type Binding struct {
 	// Set to 1 to require TLS for both data and control connection.
 	// Set to 2 to enable implicit TLS
 	TLSMode int `json:"tls_mode" mapstructure:"tls_mode"`
-	// 0 disabled, 1 required
-	TLSSessionReuse int `json:"tls_session_reuse" mapstructure:"tls_session_reuse"`
 	// Certificate and matching private key for this specific binding, if empty the global
 	// ones will be used, if any
 	CertificateFile    string `json:"certificate_file" mapstructure:"certificate_file"`
@@ -109,11 +112,6 @@ type Binding struct {
 	// Please note that disabling the security checks you will make the FTP service vulnerable to bounce attacks
 	// on active data connections, so change the default value only if you are on a trusted/internal network
 	ActiveConnectionsSecurity int `json:"active_connections_security" mapstructure:"active_connections_security"`
-	// Set to 1 to silently ignore any client requests to perform ASCII translations via the TYPE command.
-	// That is, FTP clients can request ASCII translations, and SFTPGo will respond as the client expects,
-	// but will not actually perform the translation for either uploads or downloads. This behavior can be
-	// useful in circumstances involving older/mainframe clients and EBCDIC files.
-	IgnoreASCIITransferType int `json:"ignore_ascii_transfer_type" mapstructure:"ignore_ascii_transfer_type"`
 	// Debug enables the FTP debug mode. In debug mode, every FTP command will be logged
 	Debug   bool `json:"debug" mapstructure:"debug"`
 	ciphers []uint16
@@ -139,10 +137,6 @@ func (b *Binding) IsValid() bool {
 
 func (b *Binding) isTLSModeValid() bool {
 	return b.TLSMode >= 0 && b.TLSMode <= 2
-}
-
-func (b *Binding) isTLSSessionReuseValid() bool {
-	return b.TLSSessionReuse >= 0 && b.TLSSessionReuse <= 1
 }
 
 func (b *Binding) checkSecuritySettings() error {
@@ -232,7 +226,8 @@ func (b *Binding) HasProxy() bool {
 
 // GetTLSDescription returns the TLS mode as string
 func (b *Binding) GetTLSDescription() string {
-	if certMgr == nil {
+	mgr := certMgr.Load()
+	if mgr == nil {
 		return util.I18nFTPTLSDisabled
 	}
 	switch b.TLSMode {
@@ -242,7 +237,7 @@ func (b *Binding) GetTLSDescription() string {
 		return util.I18nFTPTLSImplicit
 	}
 
-	if certMgr.HasCertificate(common.DefaultTLSKeyPaidID) || certMgr.HasCertificate(b.GetAddress()) {
+	if mgr.HasCertificate(common.DefaultTLSKeyPaidID) || mgr.HasCertificate(b.GetAddress()) {
 		return util.I18nFTPTLSMixed
 	}
 	return util.I18nFTPTLSDisabled
@@ -395,12 +390,9 @@ func (c *Configuration) Initialize(configDir string) error {
 		if err := mgr.LoadCRLs(); err != nil {
 			return err
 		}
-		certMgr = mgr
+		certMgr.Store(mgr)
 	}
-	serviceStatus = ServiceStatus{
-		Bindings:         nil,
-		PassivePortRange: c.PassivePortRange,
-	}
+	resetServiceStatus(c.PassivePortRange)
 
 	exitChannel := make(chan error, 1)
 
@@ -412,33 +404,67 @@ func (c *Configuration) Initialize(configDir string) error {
 		server := NewServer(c, configDir, binding, idx)
 
 		go func(s *Server) {
-			ftpLogger := logger.LeveledLogger{Sender: "ftpserverlib"}
+			ftpLogger := logger.NewSlogAdapter("ftpserverlib", []slog.Attr{
+				{
+					Key:   "server_id",
+					Value: slog.StringValue(fmt.Sprintf("FTP_%d", s.ID)),
+				},
+			})
 			ftpServer := ftpserver.NewFtpServer(s)
-			ftpServer.Logger = ftpLogger.With("server_id", fmt.Sprintf("FTP_%v", s.ID))
+			ftpServer.Logger = slog.New(ftpLogger)
 			logger.Info(logSender, "", "starting FTP serving, binding: %v", s.binding.GetAddress())
 			util.CheckTCP4Port(s.binding.Port)
 			exitChannel <- ftpServer.ListenAndServe()
 		}(server)
 
-		serviceStatus.Bindings = append(serviceStatus.Bindings, binding)
+		addServiceStatusBinding(binding)
 	}
 
-	serviceStatus.IsActive = true
+	setServiceStatusActive()
 
 	return <-exitChannel
 }
 
 // ReloadCertificateMgr reloads the certificate manager
 func ReloadCertificateMgr() error {
-	if certMgr != nil {
-		return certMgr.Reload()
+	if mgr := certMgr.Load(); mgr != nil {
+		return mgr.Reload()
 	}
 	return nil
 }
 
+func resetServiceStatus(portRange PortRange) {
+	serviceStatusMu.Lock()
+	defer serviceStatusMu.Unlock()
+
+	serviceStatus = ServiceStatus{
+		Bindings:         nil,
+		PassivePortRange: portRange,
+	}
+}
+
+func addServiceStatusBinding(binding Binding) {
+	serviceStatusMu.Lock()
+	defer serviceStatusMu.Unlock()
+
+	serviceStatus.Bindings = append(serviceStatus.Bindings, binding)
+}
+
+func setServiceStatusActive() {
+	serviceStatusMu.Lock()
+	defer serviceStatusMu.Unlock()
+
+	serviceStatus.IsActive = true
+}
+
 // GetStatus returns the server status
 func GetStatus() ServiceStatus {
-	return serviceStatus
+	serviceStatusMu.RLock()
+	defer serviceStatusMu.RUnlock()
+
+	status := serviceStatus
+	status.Bindings = slices.Clone(serviceStatus.Bindings)
+	return status
 }
 
 func parsePassiveIP(passiveIP string) (string, error) {

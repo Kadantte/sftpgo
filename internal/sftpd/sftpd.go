@@ -18,7 +18,9 @@
 package sftpd
 
 import (
+	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/crypto/ssh"
@@ -31,16 +33,17 @@ const (
 
 var (
 	supportedSSHCommands = []string{"scp", "md5sum", "sha1sum", "sha256sum", "sha384sum", "sha512sum", "cd", "pwd",
-		"git-receive-pack", "git-upload-pack", "git-upload-archive", "rsync", "sftpgo-copy", "sftpgo-remove"}
+		"sftpgo-copy", "sftpgo-remove"}
 	defaultSSHCommands = []string{"md5sum", "sha1sum", "sha256sum", "cd", "pwd", "scp"}
 	sshHashCommands    = []string{"md5sum", "sha1sum", "sha256sum", "sha384sum", "sha512sum"}
-	systemCommands     = []string{"git-receive-pack", "git-upload-pack", "git-upload-archive", "rsync"}
 	serviceStatus      ServiceStatus
+	serviceStatusMu    sync.RWMutex
 	certKeyAlgoNames   = map[string]string{
-		ssh.CertAlgoRSAv01:         ssh.KeyAlgoRSA,
-		ssh.CertAlgoRSASHA256v01:   ssh.KeyAlgoRSASHA256,
-		ssh.CertAlgoRSASHA512v01:   ssh.KeyAlgoRSASHA512,
-		ssh.InsecureCertAlgoDSAv01: ssh.InsecureKeyAlgoDSA, //nolint:staticcheck
+		ssh.CertAlgoRSAv01:       ssh.KeyAlgoRSA,
+		ssh.CertAlgoRSASHA256v01: ssh.KeyAlgoRSASHA256,
+		ssh.CertAlgoRSASHA512v01: ssh.KeyAlgoRSASHA512,
+		//lint:ignore SA1019 the map names the DSA certificate algorithm
+		ssh.InsecureCertAlgoDSAv01: ssh.InsecureKeyAlgoDSA,
 		ssh.CertAlgoECDSA256v01:    ssh.KeyAlgoECDSA256,
 		ssh.CertAlgoECDSA384v01:    ssh.KeyAlgoECDSA384,
 		ssh.CertAlgoECDSA521v01:    ssh.KeyAlgoECDSA521,
@@ -56,6 +59,10 @@ type sshSubsystemExitStatus struct {
 
 type sshSubsystemExecMsg struct {
 	Command string
+}
+
+type sshSubsystemMsg struct {
+	Name string
 }
 
 type hostCertificate struct {
@@ -121,7 +128,19 @@ func (s *ServiceStatus) GetPublicKeysAlgosAsString() string {
 
 // GetStatus returns the server status
 func GetStatus() ServiceStatus {
-	return serviceStatus
+	serviceStatusMu.RLock()
+	defer serviceStatusMu.RUnlock()
+
+	status := serviceStatus
+	status.Bindings = slices.Clone(serviceStatus.Bindings)
+	status.SSHCommands = slices.Clone(serviceStatus.SSHCommands)
+	status.HostKeys = slices.Clone(serviceStatus.HostKeys)
+	status.Authentications = slices.Clone(serviceStatus.Authentications)
+	status.MACs = slices.Clone(serviceStatus.MACs)
+	status.KexAlgorithms = slices.Clone(serviceStatus.KexAlgorithms)
+	status.Ciphers = slices.Clone(serviceStatus.Ciphers)
+	status.PublicKeyAlgorithms = slices.Clone(serviceStatus.PublicKeyAlgorithms)
+	return status
 }
 
 // GetDefaultSSHCommands returns the SSH commands enabled as default

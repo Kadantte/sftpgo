@@ -246,9 +246,8 @@ func (c *SFTPFsConfig) validateCredentials() error {
 // ValidateAndEncryptCredentials validates the config and encrypts credentials if they are in plain text
 func (c *SFTPFsConfig) ValidateAndEncryptCredentials(additionalData string) error {
 	if err := c.validate(); err != nil {
-		var errI18n *util.I18nError
 		errValidation := util.NewValidationError(fmt.Sprintf("could not validate SFTP fs config: %v", err))
-		if errors.As(err, &errI18n) {
+		if errI18n, ok := errors.AsType[*util.I18nError](err); ok {
 			return util.NewI18nError(errValidation, errI18n.Message)
 		}
 		return util.NewI18nError(errValidation, util.I18nErrorFsValidation)
@@ -352,7 +351,7 @@ func NewSFTPFs(connectionID, mountPath, localTempDir string, forbiddenSelfUserna
 	}
 	err = sftpFs.createConnection()
 	if err != nil {
-		sftpFs.Close() //nolint:errcheck
+		sftpFs.Close()
 	}
 	return sftpFs, err
 }
@@ -417,7 +416,7 @@ func (fs *SFTPFs) Open(name string, offset int64) (File, PipeReader, func(), err
 		//br := bufio.NewReaderSize(f, int(fs.config.BufferSize)*1024*1024)
 		//n, err := fs.copy(w, br)
 		n, err := io.Copy(w, f)
-		w.CloseWithError(err) //nolint:errcheck
+		w.CloseWithError(err)
 		f.Close()
 		fsLog(fs, logger.LevelDebug, "download completed, path: %q size: %v, err: %v", name, n, err)
 	}()
@@ -469,7 +468,7 @@ func (fs *SFTPFs) Create(name string, flag, _ int) (File, PipeWriter, func(), er
 		if err == nil && errClose != nil {
 			err = errClose
 		}
-		r.CloseWithError(err) //nolint:errcheck
+		r.CloseWithError(err)
 		p.Done(err)
 		fsLog(fs, logger.LevelDebug, "upload completed, path: %q, readed bytes: %v, err: %v err truncate: %v",
 			name, n, err, errTruncate)
@@ -490,13 +489,13 @@ func (fs *SFTPFs) Rename(source, target string, checks int) (int, int64, error) 
 	if _, ok := client.HasExtension("posix-rename@openssh.com"); ok {
 		err := client.PosixRename(source, target)
 		if checks&CheckUpdateModTime != 0 && err == nil {
-			fs.Chtimes(target, time.Now(), time.Now(), false) //nolint:errcheck
+			_ = fs.Chtimes(target, time.Now(), time.Now(), false)
 		}
 		return -1, -1, err
 	}
 	err = client.Rename(source, target)
 	if checks&CheckUpdateModTime != 0 && err == nil {
-		fs.Chtimes(target, time.Now(), time.Now(), false) //nolint:errcheck
+		_ = fs.Chtimes(target, time.Now(), time.Now(), false)
 	}
 	return -1, -1, err
 }
@@ -522,7 +521,6 @@ func (fs *SFTPFs) Mkdir(name string) error {
 	return client.Mkdir(name)
 }
 
-// Symlink creates source as a symbolic link to target.
 func (fs *SFTPFs) Symlink(source, target string) error {
 	client, err := fs.conn.getClient()
 	if err != nil {
@@ -531,7 +529,10 @@ func (fs *SFTPFs) Symlink(source, target string) error {
 	return client.Symlink(source, target)
 }
 
-// Readlink returns the destination of the named symbolic link
+// Readlink returns the destination of the named symbolic link. A link whose
+// target escapes the prefix is rejected earlier by ResolvePath (which follows the
+// leaf), so this is reached only for in-prefix links and reports the immediate
+// target, one level, as a virtual path.
 func (fs *SFTPFs) Readlink(name string) (string, error) {
 	client, err := fs.conn.getClient()
 	if err != nil {
@@ -541,7 +542,7 @@ func (fs *SFTPFs) Readlink(name string) (string, error) {
 	if err != nil {
 		return resolved, err
 	}
-	resolved = path.Clean(resolved)
+	resolved = path.Clean(strings.ReplaceAll(resolved, "\\", "/"))
 	if !path.IsAbs(resolved) {
 		// we assume that multiple links are not followed
 		resolved = path.Join(path.Dir(name), resolved)
@@ -642,6 +643,8 @@ func (*SFTPFs) IsNotSupported(err error) bool {
 func (fs *SFTPFs) CheckRootPath(username string, uid int, gid int) bool {
 	// local directory for temporary files in buffer mode
 	osFs := NewOsFs(fs.ConnectionID(), fs.localTempDir, "", nil)
+	defer osFs.Close()
+
 	osFs.CheckRootPath(username, uid, gid)
 	if fs.config.Prefix == "/" {
 		return true
@@ -683,13 +686,23 @@ func (fs *SFTPFs) GetRelativePath(name string) string {
 		rel = ""
 	}
 	if !path.IsAbs(rel) {
-		return "/" + rel
-	}
-	if fs.config.Prefix != "/" {
-		if !strings.HasPrefix(rel, fs.config.Prefix) {
+		// If we have a relative path we assume it is already relative to the virtual root
+		rel = "/" + rel
+	} else if fs.config.Prefix != "/" {
+		prefixDir := fs.config.Prefix
+		if !strings.HasSuffix(prefixDir, "/") {
+			prefixDir += "/"
+		}
+
+		if rel == fs.config.Prefix {
+			rel = "/"
+		} else if after, found := strings.CutPrefix(rel, prefixDir); found {
+			rel = path.Clean("/" + after)
+		} else {
+			// Absolute path outside of the configured prefix
+			fsLog(fs, logger.LevelWarn, "path %q is an absolute path outside %q", name, fs.config.Prefix)
 			rel = "/"
 		}
-		rel = path.Clean("/" + strings.TrimPrefix(rel, fs.config.Prefix))
 	}
 	if fs.mountPath != "" {
 		rel = path.Join(fs.mountPath, rel)
@@ -731,37 +744,18 @@ func (*SFTPFs) HasVirtualFolders() bool {
 // ResolvePath returns the matching filesystem path for the specified virtual path
 func (fs *SFTPFs) ResolvePath(virtualPath string) (string, error) {
 	if fs.mountPath != "" {
-		virtualPath = strings.TrimPrefix(virtualPath, fs.mountPath)
+		if after, found := strings.CutPrefix(virtualPath, fs.mountPath); found {
+			virtualPath = after
+		}
 	}
-	if !path.IsAbs(virtualPath) {
-		virtualPath = path.Clean("/" + virtualPath)
-	}
+	virtualPath = path.Clean("/" + virtualPath)
 	fsPath := fs.Join(fs.config.Prefix, virtualPath)
 	if fs.config.Prefix != "/" && fsPath != "/" {
-		// we need to check if this path is a symlink outside the given prefix
-		// or a file/dir inside a dir symlinked outside the prefix
-		var validatedPath string
-		var err error
-		validatedPath, err = fs.getRealPath(fsPath)
-		isNotExist := fs.IsNotExist(err)
-		if err != nil && !isNotExist {
-			fsLog(fs, logger.LevelError, "Invalid path resolution, original path %v resolved %q err: %v",
+		validatedPath, err := fs.canonicalRealPath(fsPath)
+		if err != nil {
+			fsLog(fs, logger.LevelError, "Invalid path resolution, original path %q resolved %q err: %v",
 				virtualPath, fsPath, err)
 			return "", err
-		} else if isNotExist {
-			for fs.IsNotExist(err) {
-				validatedPath = path.Dir(validatedPath)
-				if validatedPath == "/" {
-					err = nil
-					break
-				}
-				validatedPath, err = fs.getRealPath(validatedPath)
-			}
-			if err != nil {
-				fsLog(fs, logger.LevelError, "Invalid path resolution, dir %q original path %q resolved %q err: %v",
-					validatedPath, virtualPath, fsPath, err)
-				return "", err
-			}
 		}
 		if err := fs.isSubDir(validatedPath); err != nil {
 			fsLog(fs, logger.LevelError, "Invalid path resolution, dir %q original path %q resolved %q err: %v",
@@ -782,6 +776,7 @@ func (fs *SFTPFs) RealPath(p string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	resolved = path.Clean(strings.ReplaceAll(resolved, "\\", "/"))
 	if fs.config.Prefix != "/" {
 		if err := fs.isSubDir(resolved); err != nil {
 			fsLog(fs, logger.LevelError, "Invalid real path resolution, original path %q resolved %q err: %v",
@@ -792,37 +787,68 @@ func (fs *SFTPFs) RealPath(p string) (string, error) {
 	return fs.GetRelativePath(resolved), nil
 }
 
-// getRealPath returns the real remote path trying to resolve symbolic links if any
-func (fs *SFTPFs) getRealPath(name string) (string, error) {
+func (fs *SFTPFs) canonicalRealPath(name string) (string, error) {
 	client, err := fs.conn.getClient()
 	if err != nil {
 		return "", err
 	}
+	name = path.Clean("/" + strings.ReplaceAll(name, "\\", "/"))
+	resolved := "/"
+	var rest []string
+	if prefix := fs.config.Prefix; prefix != "" && prefix != "/" {
+		if name == prefix {
+			return prefix, nil
+		}
+		if below, ok := strings.CutPrefix(name, prefix+"/"); ok {
+			resolved = prefix
+			rest = strings.Split(below, "/")
+		}
+	}
+	if len(rest) == 0 {
+		rest = strings.Split(strings.TrimPrefix(name, "/"), "/")
+	}
 	linksWalked := 0
-	for {
-		info, err := client.Lstat(name)
+	for len(rest) > 0 {
+		comp := rest[0]
+		rest = rest[1:]
+		switch comp {
+		case "", ".":
+			continue
+		case "..":
+			resolved = path.Dir(resolved)
+			continue
+		}
+		candidate := path.Join(resolved, comp)
+		info, err := client.Lstat(candidate)
 		if err != nil {
-			return name, err
+			if fs.IsNotExist(err) {
+				return path.Clean(path.Join(append([]string{candidate}, rest...)...)), nil
+			}
+			return "", err
 		}
 		if info.Mode()&os.ModeSymlink == 0 {
-			return name, nil
-		}
-		resolvedLink, err := client.ReadLink(name)
-		if err != nil {
-			return name, fmt.Errorf("unable to resolve link to %q: %w", name, err)
-		}
-		resolvedLink = path.Clean(resolvedLink)
-		if path.IsAbs(resolvedLink) {
-			name = resolvedLink
-		} else {
-			name = path.Join(path.Dir(name), resolvedLink)
+			resolved = candidate
+			continue
 		}
 		linksWalked++
-		if linksWalked > 10 {
+		if linksWalked > maxResolvedSymlinks {
 			fsLog(fs, logger.LevelError, "unable to get real path, too many links: %d", linksWalked)
 			return "", &pathResolutionError{err: "too many links"}
 		}
+		target, err := client.ReadLink(candidate)
+		if err != nil {
+			return "", fmt.Errorf("unable to resolve link to %q: %w", candidate, err)
+		}
+		// do not path.Clean the target: collapsing ".." lexically here would drop a
+		// preceding symlink component ("symlink/..") and let it escape the prefix;
+		// "." and ".." below are resolved by the walker against the resolved path
+		target = strings.ReplaceAll(target, "\\", "/")
+		if path.IsAbs(target) {
+			resolved = "/"
+		}
+		rest = append(strings.Split(strings.TrimPrefix(target, "/"), "/"), rest...)
 	}
+	return path.Clean(resolved), nil
 }
 
 func (fs *SFTPFs) isSubDir(name string) error {
@@ -974,10 +1000,8 @@ func (c *sftpConnection) openConnNoLock() error {
 				}
 			}
 			if len(c.config.Fingerprints) > 0 {
-				for _, provided := range c.config.Fingerprints {
-					if provided == fp {
-						return nil
-					}
+				if slices.Contains(c.config.Fingerprints, fp) {
+					return nil
 				}
 				return fmt.Errorf("invalid fingerprint %q", fp)
 			}
@@ -996,8 +1020,7 @@ func (c *sftpConnection) openConnNoLock() error {
 	supportedAlgos := ssh.SupportedAlgorithms()
 	insecureAlgos := ssh.InsecureAlgorithms()
 	// add all available ciphers, KEXs and MACs, they are negotiated according to the order
-	clientConfig.Ciphers = append(supportedAlgos.Ciphers, ssh.InsecureCipherAES128CBC,
-		ssh.InsecureCipherAES192CBC, ssh.InsecureCipherAES256CBC)
+	clientConfig.Ciphers = append(supportedAlgos.Ciphers, ssh.InsecureCipherAES128CBC)
 	clientConfig.KeyExchanges = append(supportedAlgos.KeyExchanges, insecureAlgos.KeyExchanges...)
 	clientConfig.MACs = append(supportedAlgos.MACs, insecureAlgos.MACs...)
 	sshClient, err := ssh.Dial("tcp", c.config.Endpoint, clientConfig)
@@ -1145,7 +1168,7 @@ func (c *sftpConnection) GetLastActivity() time.Time {
 
 type sftpConnectionsCache struct {
 	scheduler *cron.Cron
-	sync.RWMutex
+	sync.Mutex
 	items map[string]*sftpConnection
 }
 
@@ -1198,30 +1221,24 @@ func (c *sftpConnectionsCache) Get(config *SFTPFsConfig, sessionID string) (*sft
 	}
 }
 
-func (c *sftpConnectionsCache) Remove(key string) {
-	c.Lock()
-	defer c.Unlock()
-
-	if conn, ok := c.items[key]; ok {
-		delete(c.items, key)
-		logger.Debug(logSenderSFTPCache, "", "removed connection with key %s, active connections: %d", key, len(c.items))
-
-		defer conn.Close()
-	}
-}
-
 func (c *sftpConnectionsCache) Cleanup() {
-	c.RLock()
+	c.Lock()
+
+	var connectionsToClose []*sftpConnection
 
 	for k, conn := range c.items {
 		if val := conn.GetLastActivity(); val.Before(time.Now().Add(-30 * time.Second)) {
-			logger.Debug(conn.logSender, "", "removing inactive connection, last activity %s", val)
-
-			defer func(key string) {
-				c.Remove(key)
-			}(k)
+			delete(c.items, k)
+			logger.Debug(logSenderSFTPCache, "", "removed connection with key %s, last activity %s, active connections: %d",
+				k, val, len(c.items))
+			connectionsToClose = append(connectionsToClose, conn)
 		}
 	}
 
-	c.RUnlock()
+	c.Unlock()
+
+	for _, conn := range connectionsToClose {
+		err := conn.Close()
+		logger.Debug(logSenderSFTPCache, "", "connection closed, err: %v", err)
+	}
 }

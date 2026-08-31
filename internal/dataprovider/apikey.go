@@ -118,7 +118,7 @@ func (k *APIKey) hashKey() error {
 			if err != nil {
 				return err
 			}
-			k.Key = util.BytesToString(hashed)
+			k.Key = string(hashed)
 		} else {
 			hashed, err := argon2id.CreateHash(k.Key, argon2Params)
 			if err != nil {
@@ -147,6 +147,9 @@ func (k *APIKey) DisplayKey() string {
 func (k *APIKey) validate() error {
 	if k.Name == "" {
 		return util.NewValidationError("name is mandatory")
+	}
+	if !util.IsNameValid(k.Name) {
+		return util.NewI18nError(errInvalidInput, util.I18nErrorInvalidInput)
 	}
 	if k.Scope != APIKeyScopeAdmin && k.Scope != APIKeyScopeUser {
 		return util.NewValidationError(fmt.Sprintf("invalid scope: %v", k.Scope))

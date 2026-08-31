@@ -20,6 +20,7 @@ import (
 	"net"
 	"net/netip"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -35,11 +36,20 @@ const (
 	// if the list contains more elements than this limit a
 	// database query will be executed
 	ipListMemoryLimit = 15000
+	// maximum number of entries a dump can carry. The check is on the total
+	// across the four supported lists, each of which can match in memory up to
+	// ipListMemoryLimit entries
+	ipListDumpLimit = ipListMemoryLimit * 4
 )
 
 var (
 	inMemoryLists map[IPListType]*IPList
 )
+
+func errTooManyIPListEntries(count int64) error {
+	return fmt.Errorf("unable to dump the IP lists, entries: %d, limit: %d. Request the other scopes to obtain "+
+		"a dump without them", count, ipListDumpLimit)
+}
 
 func init() {
 	inMemoryLists = map[IPListType]*IPList{}
@@ -156,8 +166,14 @@ func (e *IPListEntry) RenderAsJSON(reload bool) ([]byte, error) {
 	return json.Marshal(e)
 }
 
+// keyPrefix returns the provider key prefix shared by all the entries
+// with this list type
+func (t IPListType) keyPrefix() string {
+	return strconv.Itoa(int(t)) + "_"
+}
+
 func (e *IPListEntry) getKey() string {
-	return fmt.Sprintf("%d_%s", e.Type, e.IPOrNet)
+	return e.Type.keyPrefix() + e.IPOrNet
 }
 
 func (e *IPListEntry) getName() string {
@@ -411,8 +427,9 @@ func (l *IPList) DisableMemoryMode() {
 }
 
 // IsListed checks if there is a match for the specified IP and protocol.
-// If there are multiple matches, the first one is returned, in no particular order,
-// so the behavior is undefined
+// If multiple entries match, the most specific one (longest network prefix) wins.
+// Two distinct CIDRs containing the same IP have different prefix lengths, so the
+// winner is unambiguous.
 func (l *IPList) IsListed(ip, protocol string) (bool, int, error) {
 	if l.isInMemory.Load() {
 		l.mu.RLock()
@@ -431,29 +448,54 @@ func (l *IPList) IsListed(ip, protocol string) (bool, int, error) {
 		if err != nil {
 			return false, 0, fmt.Errorf("unable to find containing networks for ip %q: %w", ip, err)
 		}
+		matched := false
+		mode := 0
+		bestPrefix := -1
 		for _, e := range entries {
 			entry, ok := e.(*rangerEntry)
-			if ok {
-				if entry.entry.Protocols == 0 || entry.entry.HasProtocol(protocol) {
-					return true, entry.entry.Mode, nil
-				}
+			if !ok {
+				continue
+			}
+			if entry.entry.Protocols != 0 && !entry.entry.HasProtocol(protocol) {
+				continue
+			}
+			ones, _ := entry.network.Mask.Size()
+			if ones > bestPrefix {
+				bestPrefix = ones
+				mode = entry.entry.Mode
+				matched = true
 			}
 		}
-
-		return false, 0, nil
+		return matched, mode, nil
 	}
 
 	entries, err := provider.getListEntriesForIP(ip, l.listType)
 	if err != nil {
 		return false, 0, err
 	}
+	matched := false
+	mode := 0
+	bestPrefix := -1
 	for _, e := range entries {
-		if e.Protocols == 0 || e.HasProtocol(protocol) {
-			return true, e.Mode, nil
+		if e.Protocols != 0 && !e.HasProtocol(protocol) {
+			continue
+		}
+		idx := strings.LastIndexByte(e.IPOrNet, '/')
+		if idx < 0 {
+			continue
+		}
+		ones, err := strconv.Atoi(e.IPOrNet[idx+1:])
+		if err != nil {
+			continue
+		}
+		if ones > bestPrefix {
+			bestPrefix = ones
+			mode = e.Mode
+			matched = true
 		}
 	}
 
-	return false, 0, nil
+	return matched, mode, nil
 }
 
 // NewIPList returns a new IP list for the specified type

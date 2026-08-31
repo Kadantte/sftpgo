@@ -108,7 +108,7 @@ func (s *WindowsService) Execute(args []string, r <-chan svc.ChangeRequest, chan
 	changes <- svc.Status{State: svc.StartPending}
 
 	go func() {
-		if err := s.Service.Start(false); err != nil {
+		if err := s.Service.Start(); err != nil {
 			logger.Error(logSender, "", "Windows service failed to start, error: %v", err)
 			s.Service.Error = err
 			s.Service.Shutdown <- true
@@ -286,7 +286,7 @@ func (s *WindowsService) Install(args ...string) error {
 	err = eventlog.InstallAsEventCreate(serviceName, eventlog.Error|eventlog.Warning|eventlog.Info)
 	if err != nil {
 		if !strings.Contains(err.Error(), "exists") {
-			service.Delete()
+			_ = service.Delete()
 			return fmt.Errorf("SetupEventLogSource() failed: %s", err)
 		}
 	}
@@ -306,7 +306,7 @@ func (s *WindowsService) Install(args ...string) error {
 	}
 	err = service.SetRecoveryActions(recoveryActions, 300)
 	if err != nil {
-		service.Delete()
+		_ = service.Delete()
 		return fmt.Errorf("unable to set recovery actions: %v", err)
 	}
 	return nil

@@ -28,11 +28,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/lestrrat-go/jwx/v2/jwa"
-	"github.com/lestrrat-go/jwx/v2/jwt"
-	"github.com/rs/xid"
+	"github.com/go-jose/go-jose/v4"
 
 	"github.com/drakkan/sftpgo/v2/internal/httpclient"
+	"github.com/drakkan/sftpgo/v2/internal/jwt"
 	"github.com/drakkan/sftpgo/v2/internal/kms"
 	"github.com/drakkan/sftpgo/v2/internal/logger"
 	"github.com/drakkan/sftpgo/v2/internal/util"
@@ -46,7 +45,8 @@ const (
 
 const (
 	// NodeTokenHeader defines the header to use for the node auth token
-	NodeTokenHeader = "X-SFTPGO-Node"
+	NodeTokenHeader   = "X-SFTPGO-Node"
+	nodeTokenAudience = "node"
 )
 
 var (
@@ -112,7 +112,7 @@ func (n *NodeData) getNodeName() string {
 	h := sha256.New()
 	var b bytes.Buffer
 
-	b.WriteString(fmt.Sprintf("%s:%d", n.Host, n.Port))
+	fmt.Fprintf(&b, "%s:%d", n.Host, n.Port)
 	h.Write(b.Bytes())
 	return hex.EncodeToString(h.Sum(nil))
 }
@@ -132,33 +132,26 @@ func (n *Node) validate() error {
 	return n.Data.validate()
 }
 
-func (n *Node) authenticate(token string) (string, string, error) {
+func (n *Node) authenticate(token string) (*jwt.Claims, error) {
 	if err := n.Data.Key.TryDecrypt(); err != nil {
 		providerLog(logger.LevelError, "unable to decrypt node key: %v", err)
-		return "", "", err
+		return nil, err
 	}
 	if token == "" {
-		return "", "", ErrInvalidCredentials
+		return nil, ErrInvalidCredentials
 	}
-	t, err := jwt.Parse([]byte(token), jwt.WithKey(jwa.HS256, []byte(n.Data.Key.GetPayload())), jwt.WithValidate(true))
+	claims, err := jwt.VerifyTokenWithKey(token, []jose.SignatureAlgorithm{jose.HS256}, []byte(n.Data.Key.GetPayload()))
 	if err != nil {
-		return "", "", fmt.Errorf("unable to parse and validate token: %v", err)
+		return nil, fmt.Errorf("unable to parse and validate token: %v", err)
 	}
-	var adminUsername, role string
-	if admin, ok := t.Get("admin"); ok {
-		if val, ok := admin.(string); ok && val != "" {
-			adminUsername = val
-		}
+	if claims.Username == "" {
+		return nil, errors.New("no admin username associated with node token")
 	}
-	if adminUsername == "" {
-		return "", "", errors.New("no admin username associated with node token")
+	if !claims.Audience.Contains(nodeTokenAudience) {
+		return nil, errors.New("invalid node token audience")
 	}
-	if r, ok := t.Get("role"); ok {
-		if val, ok := r.(string); ok && val != "" {
-			role = val
-		}
-	}
-	return adminUsername, role, nil
+
+	return claims, nil
 }
 
 // getBaseURL returns the base URL for this node
@@ -175,36 +168,37 @@ func (n *Node) getBaseURL() string {
 }
 
 // generateAuthToken generates a new auth token
-func (n *Node) generateAuthToken(username, role string) (string, error) {
+func (n *Node) generateAuthToken(username, role string, permissions []string) (string, error) {
 	if err := n.Data.Key.TryDecrypt(); err != nil {
 		return "", fmt.Errorf("unable to decrypt node key: %w", err)
 	}
-	now := time.Now().UTC()
-
-	t := jwt.New()
-	t.Set("admin", username)                          //nolint:errcheck
-	t.Set("role", role)                               //nolint:errcheck
-	t.Set(jwt.IssuedAtKey, now)                       //nolint:errcheck
-	t.Set(jwt.JwtIDKey, xid.New().String())           //nolint:errcheck
-	t.Set(jwt.NotBeforeKey, now.Add(-30*time.Second)) //nolint:errcheck
-	t.Set(jwt.ExpirationKey, now.Add(1*time.Minute))  //nolint:errcheck
-
-	payload, err := jwt.Sign(t, jwt.WithKey(jwa.HS256, []byte(n.Data.Key.GetPayload())))
+	signer, err := jwt.NewSigner(jose.HS256, []byte(n.Data.Key.GetPayload()))
+	if err != nil {
+		return "", fmt.Errorf("unable to create signer: %w", err)
+	}
+	claims := &jwt.Claims{
+		Username:    username,
+		Role:        role,
+		Permissions: permissions,
+	}
+	claims.Audience = []string{nodeTokenAudience}
+	claims.SetExpiry(time.Now().Add(1 * time.Minute))
+	payload, err := signer.Sign(claims)
 	if err != nil {
 		return "", fmt.Errorf("unable to sign authentication token: %w", err)
 	}
-	return util.BytesToString(payload), nil
+	return payload, nil
 }
 
 func (n *Node) prepareRequest(ctx context.Context, username, role, relativeURL, method string,
-	body io.Reader,
+	permissions []string, body io.Reader,
 ) (*http.Request, error) {
 	url := fmt.Sprintf("%s%s", n.getBaseURL(), relativeURL)
 	req, err := http.NewRequestWithContext(ctx, method, url, body)
 	if err != nil {
 		return nil, err
 	}
-	token, err := n.generateAuthToken(username, role)
+	token, err := n.generateAuthToken(username, role, permissions)
 	if err != nil {
 		return nil, err
 	}
@@ -214,11 +208,11 @@ func (n *Node) prepareRequest(ctx context.Context, username, role, relativeURL, 
 
 // SendGetRequest sends an HTTP GET request to this node.
 // The responseHolder must be a pointer
-func (n *Node) SendGetRequest(username, role, relativeURL string, responseHolder any) error {
+func (n *Node) SendGetRequest(username, role, relativeURL string, permissions []string, responseHolder any) error {
 	ctx, cancel := context.WithTimeout(context.Background(), nodeReqTimeout)
 	defer cancel()
 
-	req, err := n.prepareRequest(ctx, username, role, relativeURL, http.MethodGet, nil)
+	req, err := n.prepareRequest(ctx, username, role, relativeURL, http.MethodGet, permissions, nil)
 	if err != nil {
 		return err
 	}
@@ -246,11 +240,11 @@ func (n *Node) SendGetRequest(username, role, relativeURL string, responseHolder
 }
 
 // SendDeleteRequest sends an HTTP DELETE request to this node
-func (n *Node) SendDeleteRequest(username, role, relativeURL string) error {
+func (n *Node) SendDeleteRequest(username, role, relativeURL string, permissions []string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), nodeReqTimeout)
 	defer cancel()
 
-	req, err := n.prepareRequest(ctx, username, role, relativeURL, http.MethodDelete, nil)
+	req, err := n.prepareRequest(ctx, username, role, relativeURL, http.MethodDelete, permissions, nil)
 	if err != nil {
 		return err
 	}
@@ -270,9 +264,9 @@ func (n *Node) SendDeleteRequest(username, role, relativeURL string) error {
 }
 
 // AuthenticateNodeToken check the validity of the provided token
-func AuthenticateNodeToken(token string) (string, string, error) {
+func AuthenticateNodeToken(token string) (*jwt.Claims, error) {
 	if currentNode == nil {
-		return "", "", errNoClusterNodes
+		return nil, errNoClusterNodes
 	}
 	return currentNode.authenticate(token)
 }

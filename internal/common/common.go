@@ -122,6 +122,14 @@ const (
 	UploadModeAzureBlobStoreOnError = 16
 )
 
+const (
+	// SymlinkModeAllowLocal allows symbolic link creation on the local filesystem
+	// backend, including its encrypted variant.
+	SymlinkModeAllowLocal = 1
+	// SymlinkModeAllowSFTP allows symbolic link creation on the SFTP backend.
+	SymlinkModeAllowSFTP = 2
+)
+
 func init() {
 	Connections.clients = clientsMap{
 		clients: make(map[string]int),
@@ -129,9 +137,13 @@ func init() {
 	Connections.transfers = clientsMap{
 		clients: make(map[string]int),
 	}
+	Connections.transfersPerIP = clientsMap{
+		clients: make(map[string]int),
+	}
 	Connections.perUserConns = make(map[string]int)
 	Connections.mapping = make(map[string]int)
 	Connections.sshMapping = make(map[string]int)
+	proxyproto.V1AcceptIPv4InTCP6 = true
 }
 
 // errors definitions
@@ -243,12 +255,11 @@ func Initialize(c Configuration, isShared int) error {
 	if err := c.EventManager.validate(); err != nil {
 		return err
 	}
-	vfs.SetTempPath(c.TempPath)
-	dataprovider.SetTempPath(c.TempPath)
 	vfs.SetAllowSelfConnections(c.AllowSelfConnections)
 	vfs.SetRenameMode(c.RenameMode)
 	vfs.SetReadMetadataMode(c.Metadata.Read)
 	vfs.SetResumeMaxSize(c.ResumeMaxSize)
+	vfs.SetSecretMinEntropy(c.SecretMinEntropy)
 	vfs.SetUploadMode(c.UploadMode)
 	dataprovider.SetAllowSelfConnections(c.AllowSelfConnections)
 	dataprovider.EnabledActionCommands = c.EventManager.EnabledCommands
@@ -463,6 +474,7 @@ type ActiveTransfer interface {
 	GetDownloadedSize() int64
 	GetUploadedSize() int64
 	GetVirtualPath() string
+	GetFsPath() string
 	GetStartTime() time.Time
 	SignalClose(err error)
 	Truncate(fsPath string, size int64) (int64, error)
@@ -572,18 +584,23 @@ type Configuration struct {
 	// renames for these providers, they may be slow, there is no atomic rename API like for local
 	// filesystem, so SFTPGo will recursively list the directory contents and do a rename for each entry
 	RenameMode int `json:"rename_mode" mapstructure:"rename_mode"`
+	// SymlinkMode is a bit mask that selects the backends on which clients holding the
+	// create_symlinks permission may create symbolic links. 0 (default) disables creation
+	// on every backend; add 1 to allow it on the local filesystem (including its encrypted
+	// variant), 2 to allow it on the SFTP backend, 3 for both.
+	SymlinkMode int `json:"symlink_mode" mapstructure:"symlink_mode"`
 	// ResumeMaxSize defines the maximum size allowed, in bytes, to resume uploads on storage backends
 	// with immutable objects. By default, resuming uploads is not allowed for cloud storage providers
 	// (S3, GCS, Azure Blob) because SFTPGo must rewrite the entire file.
 	// Set to a value greater than 0 to allow resuming uploads of files smaller than or equal to the
 	// defined size.
 	ResumeMaxSize int64 `json:"resume_max_size" mapstructure:"resume_max_size"`
-	// TempPath defines the path for temporary files such as those used for atomic uploads or file pipes.
-	// If you set this option you must make sure that the defined path exists, is accessible for writing
-	// by the user running SFTPGo, and is on the same filesystem as the users home directories otherwise
-	// the renaming for atomic uploads will become a copy and therefore may take a long time.
-	// The temporary files are not namespaced. The default is generally fine. Leave empty for the default.
-	TempPath string `json:"temp_path" mapstructure:"temp_path"`
+	// SecretMinEntropy defines the minimum entropy required for plain-text
+	// data-encryption secrets: the CryptFs passphrase and the S3 SSE-C key. These
+	// secrets must be random key material rather than a memorable password. The
+	// check runs when the secret is submitted in plain text. Set to 0 to disable.
+	// Default: 80.
+	SecretMinEntropy float64 `json:"secret_min_entropy" mapstructure:"secret_min_entropy"`
 	// Support for HAProxy PROXY protocol.
 	// If you are running SFTPGo behind a proxy server such as HAProxy, AWS ELB or NGNIX, you can enable
 	// the proxy protocol. It provides a convenient way to safely transport connection information
@@ -655,6 +672,19 @@ type Configuration struct {
 // IsAtomicUploadEnabled returns true if atomic upload is enabled
 func (c *Configuration) IsAtomicUploadEnabled() bool {
 	return c.UploadMode&UploadModeAtomic != 0 || c.UploadMode&UploadModeAtomicWithResume != 0
+}
+
+// IsSymlinkCreationAllowed returns true if clients are allowed to create symbolic links
+// on the given filesystem backend.
+func (c *Configuration) IsSymlinkCreationAllowed(fs vfs.Fs) bool {
+	switch {
+	case vfs.IsLocalOrCryptoFs(fs):
+		return c.SymlinkMode&SymlinkModeAllowLocal != 0
+	case vfs.IsSFTPFs(fs):
+		return c.SymlinkMode&SymlinkModeAllowSFTP != 0
+	default:
+		return false
+	}
 }
 
 func (c *Configuration) initializeProxyProtocol() error {
@@ -937,7 +967,9 @@ type ActiveConnections struct {
 	// for authentication
 	clients clientsMap
 	// transfers contains active transfers, total and per-user
-	transfers            clientsMap
+	transfers clientsMap
+	// transfersPerIP contains active transfers per client IP, used to enforce MaxPerHostConnections
+	transfersPerIP       clientsMap
 	transfersCheckStatus atomic.Bool
 	sync.RWMutex
 	connections    []ActiveConnection
@@ -987,9 +1019,6 @@ func (conns *ActiveConnections) Add(c ActiveConnection) error {
 		if maxSessions := c.GetMaxSessions(); maxSessions > 0 {
 			if val := conns.perUserConns[username]; val >= maxSessions {
 				return fmt.Errorf("too many open sessions: %d/%d", val, maxSessions)
-			}
-			if val := conns.transfers.getTotalFrom(username); val >= maxSessions {
-				return fmt.Errorf("too many open transfers: %d/%d", val, maxSessions)
 			}
 		}
 		conns.addUserConnection(username)
@@ -1161,7 +1190,7 @@ func (conns *ActiveConnections) checkIdles() {
 				logger.Debug(conn.GetProtocol(), conn.GetID(), "close idle connection, idle time: %s, username: %q close err: %v",
 					time.Since(conn.GetLastActivity()), conn.GetUsername(), err)
 			}(c)
-		} else if !c.isAccessAllowed() {
+		} else if !isUnauthenticatedFTPUser && !c.isAccessAllowed() {
 			defer func(conn ActiveConnection) {
 				err := conn.Disconnect()
 				logger.Info(conn.GetProtocol(), conn.GetID(), "access conditions not met for user: %q close connection err: %v",
@@ -1174,26 +1203,27 @@ func (conns *ActiveConnections) checkIdles() {
 }
 
 func (conns *ActiveConnections) checkTransfers() {
-	if conns.transfersCheckStatus.Load() {
+	if !conns.transfersCheckStatus.CompareAndSwap(false, true) {
 		logger.Warn(logSender, "", "the previous transfer check is still running, skipping execution")
 		return
 	}
-	conns.transfersCheckStatus.Store(true)
 	defer conns.transfersCheckStatus.Store(false)
 
 	conns.RLock()
 
-	if len(conns.connections) < 2 {
+	if !dataprovider.IsSharedMode() && len(conns.connections) < 2 {
 		conns.RUnlock()
 		return
 	}
 	var wg sync.WaitGroup
+	hasSizeLimitedTransfer := false
 	logger.Debug(logSender, "", "start concurrent transfers check")
 
 	// update the current size for transfers to monitors
 	for _, c := range conns.connections {
 		for _, t := range c.GetTransfers() {
 			if t.HasSizeLimit {
+				hasSizeLimitedTransfer = true
 				wg.Add(1)
 
 				go func(transfer ConnectionTransfer, connID string) {
@@ -1205,6 +1235,11 @@ func (conns *ActiveConnections) checkTransfers() {
 	}
 
 	conns.RUnlock()
+
+	if !hasSizeLimitedTransfer {
+		return
+	}
+
 	logger.Debug(logSender, "", "waiting for the update of the transfers current size")
 	wg.Wait()
 
@@ -1257,23 +1292,33 @@ func (conns *ActiveConnections) GetTotalTransfers() int32 {
 }
 
 // IsNewTransferAllowed returns an error if the maximum number of concurrent allowed
-// transfers is exceeded
-func (conns *ActiveConnections) IsNewTransferAllowed(username string) error {
+// transfers is exceeded for the client connection, its IP address or the user
+func (conns *ActiveConnections) IsNewTransferAllowed(c *BaseConnection) error {
 	if isShuttingDown.Load() {
 		return ErrShuttingDown
 	}
-	if Config.MaxTotalConnections == 0 && Config.MaxPerHostConnections == 0 {
+	username := c.GetUsername()
+	maxSessions := c.GetMaxSessions()
+	if Config.MaxTotalConnections == 0 && Config.MaxPerHostConnections == 0 && (maxSessions == 0 || username == "") {
 		return nil
 	}
-	if Config.MaxPerHostConnections > 0 {
-		if transfers := conns.transfers.getTotalFrom(username); transfers >= Config.MaxPerHostConnections {
-			logger.Info(logSender, "", "active transfers from user %q: %d/%d", username, transfers, Config.MaxPerHostConnections)
+	if maxSessions > 0 && username != "" {
+		if transfers := conns.transfers.getTotalFrom(username); transfers >= maxSessions {
+			logger.Info(logSender, "", "denying new transfer, active transfers from user %q: %d/%d", username, transfers, maxSessions)
 			return ErrConnectionDenied
+		}
+	}
+	if Config.MaxPerHostConnections > 0 {
+		if ipAddr := c.GetRemoteIP(); ipAddr != "" {
+			if transfers := conns.transfersPerIP.getTotalFrom(ipAddr); transfers >= Config.MaxPerHostConnections {
+				logger.Info(logSender, "", "denying new transfer, active transfers from IP %q: %d/%d", ipAddr, transfers, Config.MaxPerHostConnections)
+				return ErrConnectionDenied
+			}
 		}
 	}
 	if Config.MaxTotalConnections > 0 {
 		if transfers := conns.transfers.getTotal(); transfers >= int32(Config.MaxTotalConnections) {
-			logger.Info(logSender, "", "active transfers %d/%d", transfers, Config.MaxTotalConnections)
+			logger.Info(logSender, "", "denying new transfer, active transfers %d/%d", transfers, Config.MaxTotalConnections)
 			return ErrConnectionDenied
 		}
 	}

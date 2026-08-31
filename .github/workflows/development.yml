@@ -15,16 +15,16 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        go: ['1.24']
+        go: ['1.26']
         os: [ubuntu-latest, macos-latest]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version: ${{ matrix.go }}
 
@@ -48,7 +48,7 @@ jobs:
         run: go test -v -tags nopgxregisterdefaulttypes,disable_grpc_modules -p 1 -timeout 15m ./... -coverprofile=coverage.txt -covermode=atomic
 
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@v7
         with:
           files: ./coverage.txt
           fail_ci_if_error: false
@@ -93,92 +93,34 @@ jobs:
 
       - name: Upload build artifact
         if: startsWith(matrix.os, 'ubuntu-') != true
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: sftpgo-${{ matrix.os }}-go-${{ matrix.go }}
           path: output
 
   test-deploy-windows:
     name: Test and deploy Windows
-    environment: signing
     runs-on: windows-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
-      - name: Azure login
-        if: ${{ github.event_name != 'pull_request' }}
-        uses: azure/login@v2
-        with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
-          go-version: '1.24'
+          go-version: '1.26'
 
-      - name: Build
+      - name: Run test cases using SQLite provider
         run: |
-          $GIT_COMMIT = (git describe --always --abbrev=8 --dirty) | Out-String
-          $DATE_TIME = ([datetime]::Now.ToUniversalTime().toString("yyyy-MM-ddTHH:mm:ssZ")) | Out-String
-          $LATEST_TAG = ((git describe --tags $(git rev-list --tags --max-count=1)) | Out-String).Trim()
-          $REV_LIST=$LATEST_TAG+"..HEAD"
-          $COMMITS_FROM_TAG= ((git rev-list $REV_LIST --count) | Out-String).Trim()
-          $FILE_VERSION = $LATEST_TAG.substring(1)  + "." + $COMMITS_FROM_TAG
-          go install github.com/tc-hib/go-winres@latest
-          go-winres simply --arch amd64 --product-version $LATEST_TAG-dev-$GIT_COMMIT --file-version "$FILE_VERSION" --file-description "SFTPGo server" --product-name SFTPGo --copyright "2019-2025 Nicola Murino" --original-filename sftpgo.exe --icon  .\windows-installer\icon.ico
-          go build -trimpath -tags nopgxregisterdefaulttypes,disable_grpc_modules -ldflags "-s -w -X github.com/drakkan/sftpgo/v2/internal/version.commit=$GIT_COMMIT -X github.com/drakkan/sftpgo/v2/internal/version.date=$DATE_TIME" -o sftpgo.exe
           cd tests/eventsearcher
           go build -trimpath -ldflags "-s -w" -o eventsearcher.exe
           cd ../..
           cd tests/ipfilter
           go build -trimpath -ldflags "-s -w" -o ipfilter.exe
           cd ../..
-          mkdir arm64
-          $Env:CGO_ENABLED='0'
-          $Env:GOOS='windows'
-          $Env:GOARCH='arm64'
-          go-winres simply --arch arm64 --product-version $LATEST_TAG-dev-$GIT_COMMIT --file-version "$FILE_VERSION" --file-description "SFTPGo server" --product-name SFTPGo --copyright "2019-2025 Nicola Murino" --original-filename sftpgo.exe --icon  .\windows-installer\icon.ico
-          go build -trimpath -tags nopgxregisterdefaulttypes,disable_grpc_modules,nosqlite -ldflags "-s -w -X github.com/drakkan/sftpgo/v2/internal/version.commit=$GIT_COMMIT -X github.com/drakkan/sftpgo/v2/internal/version.date=$DATE_TIME" -o .\arm64\sftpgo.exe
-          mkdir x86
-          $Env:GOARCH='386'
-          go-winres simply --arch 386 --product-version $LATEST_TAG-dev-$GIT_COMMIT --file-version "$FILE_VERSION" --file-description "SFTPGo server" --product-name SFTPGo --copyright "2019-2025 Nicola Murino" --original-filename sftpgo.exe --icon  .\windows-installer\icon.ico
-          go build -trimpath -tags nopgxregisterdefaulttypes,disable_grpc_modules,nosqlite -ldflags "-s -w -X github.com/drakkan/sftpgo/v2/internal/version.commit=$GIT_COMMIT -X github.com/drakkan/sftpgo/v2/internal/version.date=$DATE_TIME" -o .\x86\sftpgo.exe
-          Remove-Item Env:\CGO_ENABLED
-          Remove-Item Env:\GOOS
-          Remove-Item Env:\GOARCH
-
-      - name: Sign binaries
-        if: ${{ github.event_name != 'pull_request' }}
-        uses: azure/trusted-signing-action@v0.5.1
-        with:
-          endpoint: https://eus.codesigning.azure.net/
-          trusted-signing-account-name: nicola
-          certificate-profile-name: SFTPGo
-          files: |
-            ${{ github.workspace }}\sftpgo.exe
-            ${{ github.workspace }}\arm64\sftpgo.exe
-            ${{ github.workspace }}\x86\sftpgo.exe
-          file-digest: SHA256
-          timestamp-rfc3161: http://timestamp.acs.microsoft.com
-          timestamp-digest: SHA256
-          exclude-environment-credential: true
-          exclude-workload-identity-credential: true
-          exclude-managed-identity-credential: true
-          exclude-shared-token-cache-credential: true
-          exclude-visual-studio-credential: true
-          exclude-visual-studio-code-credential: true
-          exclude-azure-cli-credential: false
-          exclude-azure-powershell-credential: true
-          exclude-azure-developer-cli-credential: true
-          exclude-interactive-browser-credential: true
-
-      - name: Run test cases using SQLite provider
-        run: go test -v -tags nopgxregisterdefaulttypes,disable_grpc_modules -p 1 -timeout 15m ./... -coverprofile=coverage.txt -covermode=atomic
+          go test -v -tags nopgxregisterdefaulttypes,disable_grpc_modules -p 1 -timeout 15m ./... -coverprofile=coverage.txt -covermode=atomic
 
       - name: Run test cases using bolt provider
         run: |
@@ -201,6 +143,31 @@ jobs:
           SFTPGO_DATA_PROVIDER__DRIVER: memory
           SFTPGO_DATA_PROVIDER__NAME: ''
 
+      - name: Build
+        run: |
+          $GIT_COMMIT = (git describe --always --abbrev=8 --dirty) | Out-String
+          $DATE_TIME = ([datetime]::Now.ToUniversalTime().toString("yyyy-MM-ddTHH:mm:ssZ")) | Out-String
+          $LATEST_TAG = ((git describe --tags $(git rev-list --tags --max-count=1)) | Out-String).Trim()
+          $REV_LIST=$LATEST_TAG+"..HEAD"
+          $COMMITS_FROM_TAG= ((git rev-list $REV_LIST --count) | Out-String).Trim()
+          $FILE_VERSION = $LATEST_TAG.substring(1)  + "." + $COMMITS_FROM_TAG
+          go install github.com/tc-hib/go-winres@latest
+          go-winres simply --arch amd64 --product-version $LATEST_TAG-dev-$GIT_COMMIT --file-version "$FILE_VERSION" --file-description "SFTPGo server" --product-name SFTPGo --copyright "2019-2025 Nicola Murino" --original-filename sftpgo.exe --icon  .\windows-installer\icon.ico
+          go build -trimpath -tags nopgxregisterdefaulttypes,disable_grpc_modules -ldflags "-s -w -X github.com/drakkan/sftpgo/v2/internal/version.commit=$GIT_COMMIT -X github.com/drakkan/sftpgo/v2/internal/version.date=$DATE_TIME" -o sftpgo.exe
+          mkdir arm64
+          $Env:CGO_ENABLED='0'
+          $Env:GOOS='windows'
+          $Env:GOARCH='arm64'
+          go-winres simply --arch arm64 --product-version $LATEST_TAG-dev-$GIT_COMMIT --file-version "$FILE_VERSION" --file-description "SFTPGo server" --product-name SFTPGo --copyright "2019-2025 Nicola Murino" --original-filename sftpgo.exe --icon  .\windows-installer\icon.ico
+          go build -trimpath -tags nopgxregisterdefaulttypes,disable_grpc_modules,nosqlite -ldflags "-s -w -X github.com/drakkan/sftpgo/v2/internal/version.commit=$GIT_COMMIT -X github.com/drakkan/sftpgo/v2/internal/version.date=$DATE_TIME" -o .\arm64\sftpgo.exe
+          mkdir x86
+          $Env:GOARCH='386'
+          go-winres simply --arch 386 --product-version $LATEST_TAG-dev-$GIT_COMMIT --file-version "$FILE_VERSION" --file-description "SFTPGo server" --product-name SFTPGo --copyright "2019-2025 Nicola Murino" --original-filename sftpgo.exe --icon  .\windows-installer\icon.ico
+          go build -trimpath -tags nopgxregisterdefaulttypes,disable_grpc_modules,nosqlite -ldflags "-s -w -X github.com/drakkan/sftpgo/v2/internal/version.commit=$GIT_COMMIT -X github.com/drakkan/sftpgo/v2/internal/version.date=$DATE_TIME" -o .\x86\sftpgo.exe
+          Remove-Item Env:\CGO_ENABLED
+          Remove-Item Env:\GOOS
+          Remove-Item Env:\GOARCH
+
       - name: Initialize data provider
         run: |
           rm sftpgo.db
@@ -210,6 +177,7 @@ jobs:
       - name: Prepare Windows installers
         if: ${{ github.event_name != 'pull_request' }}
         run: |
+          choco install innosetup
           Remove-Item -LiteralPath "output" -Force -Recurse -ErrorAction Ignore
           mkdir output
           copy .\sftpgo.exe .\output
@@ -246,48 +214,23 @@ jobs:
           $Env:SFTPGO_ISS_ARCH='x86'
           iscc .\windows-installer\sftpgo.iss
 
-      - name: Sign installers
-        if: ${{ github.event_name != 'pull_request' }}
-        uses: azure/trusted-signing-action@v0.5.1
-        with:
-          endpoint: https://eus.codesigning.azure.net/
-          trusted-signing-account-name: nicola
-          certificate-profile-name: SFTPGo
-          files: |
-            ${{ github.workspace }}\sftpgo_windows_x86_64.exe
-            ${{ github.workspace }}\sftpgo_windows_arm64.exe
-            ${{ github.workspace }}\sftpgo_windows_x86.exe
-          file-digest: SHA256
-          timestamp-rfc3161: http://timestamp.acs.microsoft.com
-          timestamp-digest: SHA256
-          exclude-environment-credential: true
-          exclude-workload-identity-credential: true
-          exclude-managed-identity-credential: true
-          exclude-shared-token-cache-credential: true
-          exclude-visual-studio-credential: true
-          exclude-visual-studio-code-credential: true
-          exclude-azure-cli-credential: false
-          exclude-azure-powershell-credential: true
-          exclude-azure-developer-cli-credential: true
-          exclude-interactive-browser-credential: true
-
       - name: Upload Windows installer x86_64 artifact
         if: ${{ github.event_name != 'pull_request' }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: sftpgo_windows_installer_x86_64
           path: ./sftpgo_windows_x86_64.exe
 
       - name: Upload Windows installer arm64 artifact
         if: ${{ github.event_name != 'pull_request' }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: sftpgo_windows_installer_arm64
           path: ./sftpgo_windows_arm64.exe
 
       - name: Upload Windows installer x86 artifact
         if: ${{ github.event_name != 'pull_request' }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: sftpgo_windows_installer_x86
           path: ./sftpgo_windows_x86.exe
@@ -311,7 +254,7 @@ jobs:
           xcopy .\openapi .\output\openapi\ /E
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: sftpgo-windows-portable
           path: output
@@ -321,12 +264,12 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
-          go-version: '1.24'
+          go-version: '1.26'
 
       - name: Build
         run: |
@@ -385,12 +328,12 @@ jobs:
           - 3308:3306
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
-          go-version: '1.24'
+          go-version: '1.26'
 
       - name: Build
         run: |
@@ -484,7 +427,7 @@ jobs:
             go: latest
             go-arch: arm7
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -578,7 +521,7 @@ jobs:
             cp sftpgo output/
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: sftpgo-linux-${{ matrix.arch }}-go-${{ matrix.go }}
           path: output
@@ -593,27 +536,53 @@ jobs:
           echo "pkg-version=${PKG_VERSION}" >> $GITHUB_OUTPUT
 
       - name: Upload Debian Package
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: sftpgo-${{ steps.build_linux_pkgs.outputs.pkg-version }}-${{ matrix.go-arch }}-deb
           path: pkgs/dist/deb/*
 
       - name: Upload RPM Package
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: sftpgo-${{ steps.build_linux_pkgs.outputs.pkg-version }}-${{ matrix.go-arch }}-rpm
           path: pkgs/dist/rpm/*
 
-  golangci-lint:
-    name: golangci-lint
+  lint:
+    name: lint
     runs-on: ubuntu-latest
+
     steps:
+      - uses: actions/checkout@v7
+
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
-          go-version: '1.24'
-      - uses: actions/checkout@v4
-      - name: Run golangci-lint
-        uses: golangci/golangci-lint-action@v8
-        with:
-          version: latest
+          go-version: '1.26'
+
+      - name: Lint
+        run: |
+          export PATH="$(go env GOPATH)/bin:$PATH"
+          go install honnef.co/go/tools/cmd/staticcheck@v0.8.1
+          go install github.com/kisielk/errcheck@v1.20.0
+          go install mvdan.cc/unparam@v0.0.0-20260823230713-2fa3d841b0c8
+
+          set +e
+          rc=0
+          flags="-ignoretests -exclude .errcheck-excludes"
+
+          echo "==> go vet";                  go vet ./... || rc=1
+          echo "==> staticcheck";             staticcheck ./... || rc=1
+          echo "==> errcheck";                errcheck $flags ./... || rc=1
+          echo "==> unparam"
+          out=$(unparam -tests ./... | grep -vFf .unparam-excludes)
+          [ -z "$out" ] || { echo "$out"; rc=1; }
+
+          echo "==> go vet (windows)";        GOOS=windows go vet ./... || rc=1
+          echo "==> staticcheck (windows)";   GOOS=windows staticcheck ./... || rc=1
+          echo "==> errcheck (windows)";      GOOS=windows errcheck $flags ./... || rc=1
+
+          echo "==> gofmt"
+          out=$(gofmt -s -l .)
+          [ -z "$out" ] || { echo "$out"; rc=1; }
+
+          exit $rc

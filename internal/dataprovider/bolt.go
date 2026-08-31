@@ -39,7 +39,7 @@ import (
 )
 
 const (
-	boltDatabaseVersion = 32
+	boltDatabaseVersion = 36
 )
 
 var (
@@ -228,7 +228,7 @@ func (p *BoltProvider) getUserSignature(username string) (string, error) {
 }
 
 func (p *BoltProvider) setUpdatedAt(username string) {
-	p.dbHandle.Update(func(tx *bolt.Tx) error { //nolint:errcheck
+	_ = p.dbHandle.Update(func(tx *bolt.Tx) error {
 		bucket, err := p.getUsersBucket(tx)
 		if err != nil {
 			return err
@@ -446,9 +446,6 @@ func (p *BoltProvider) addAdmin(admin *Admin) error {
 		admin.LastLogin = 0
 		admin.CreatedAt = util.GetTimeAsMsSinceEpoch(time.Now())
 		admin.UpdatedAt = util.GetTimeAsMsSinceEpoch(time.Now())
-		sort.Slice(admin.Groups, func(i, j int) bool {
-			return admin.Groups[i].Name < admin.Groups[j].Name
-		})
 		for idx := range admin.Groups {
 			err = p.addAdminToGroupMapping(admin.Username, admin.Groups[idx].Name, groupBucket)
 			if err != nil {
@@ -507,9 +504,6 @@ func (p *BoltProvider) updateAdmin(admin *Admin) error {
 		if err = p.addAdminToRole(admin.Username, admin.Role, rolesBucket); err != nil {
 			return err
 		}
-		sort.Slice(admin.Groups, func(i, j int) bool {
-			return admin.Groups[i].Name < admin.Groups[j].Name
-		})
 		for idx := range admin.Groups {
 			err = p.addAdminToGroupMapping(admin.Username, admin.Groups[idx].Name, groupBucket)
 			if err != nil {
@@ -721,18 +715,12 @@ func (p *BoltProvider) addUser(user *User) error {
 		if err := p.addUserToRole(user.Username, user.Role, rolesBucket); err != nil {
 			return err
 		}
-		sort.Slice(user.VirtualFolders, func(i, j int) bool {
-			return user.VirtualFolders[i].Name < user.VirtualFolders[j].Name
-		})
 		for idx := range user.VirtualFolders {
 			err = p.addRelationToFolderMapping(user.VirtualFolders[idx].Name, user, nil, foldersBucket)
 			if err != nil {
 				return err
 			}
 		}
-		sort.Slice(user.Groups, func(i, j int) bool {
-			return user.Groups[i].Name < user.Groups[j].Name
-		})
 		for idx := range user.Groups {
 			err = p.addUserToGroupMapping(user.Username, user.Groups[idx].Name, groupBucket)
 			if err != nil {
@@ -1219,73 +1207,9 @@ func (p *BoltProvider) updateFolder(folder *vfs.BaseVirtualFolder) error {
 	})
 }
 
-func (p *BoltProvider) deleteFolderMappings(folder vfs.BaseVirtualFolder, usersBucket, groupsBucket *bolt.Bucket) error {
-	for _, username := range folder.Users {
-		var u []byte
-		if u = usersBucket.Get([]byte(username)); u == nil {
-			continue
-		}
-		var user User
-		err := json.Unmarshal(u, &user)
-		if err != nil {
-			return err
-		}
-		var folders []vfs.VirtualFolder
-		for _, userFolder := range user.VirtualFolders {
-			if folder.Name != userFolder.Name {
-				folders = append(folders, userFolder)
-			}
-		}
-		user.VirtualFolders = folders
-		buf, err := json.Marshal(user)
-		if err != nil {
-			return err
-		}
-		err = usersBucket.Put([]byte(user.Username), buf)
-		if err != nil {
-			return err
-		}
-	}
-	for _, groupname := range folder.Groups {
-		var u []byte
-		if u = groupsBucket.Get([]byte(groupname)); u == nil {
-			continue
-		}
-		var group Group
-		err := json.Unmarshal(u, &group)
-		if err != nil {
-			return err
-		}
-		var folders []vfs.VirtualFolder
-		for _, groupFolder := range group.VirtualFolders {
-			if folder.Name != groupFolder.Name {
-				folders = append(folders, groupFolder)
-			}
-		}
-		group.VirtualFolders = folders
-		buf, err := json.Marshal(group)
-		if err != nil {
-			return err
-		}
-		err = groupsBucket.Put([]byte(group.Name), buf)
-		if err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 func (p *BoltProvider) deleteFolder(baseFolder vfs.BaseVirtualFolder) error {
 	return p.dbHandle.Update(func(tx *bolt.Tx) error {
 		bucket, err := p.getFoldersBucket(tx)
-		if err != nil {
-			return err
-		}
-		usersBucket, err := p.getUsersBucket(tx)
-		if err != nil {
-			return err
-		}
-		groupsBucket, err := p.getGroupsBucket(tx)
 		if err != nil {
 			return err
 		}
@@ -1299,8 +1223,8 @@ func (p *BoltProvider) deleteFolder(baseFolder vfs.BaseVirtualFolder) error {
 		if err != nil {
 			return err
 		}
-		if err = p.deleteFolderMappings(folder, usersBucket, groupsBucket); err != nil {
-			return err
+		if len(folder.Users) > 0 || len(folder.Groups) > 0 {
+			return util.NewValidationError(fmt.Sprintf("the folder %q is referenced, it cannot be removed", folder.Name))
 		}
 
 		return bucket.Delete([]byte(folder.Name))
@@ -1504,9 +1428,6 @@ func (p *BoltProvider) addGroup(group *Group) error {
 		group.UpdatedAt = util.GetTimeAsMsSinceEpoch(time.Now())
 		group.Users = nil
 		group.Admins = nil
-		sort.Slice(group.VirtualFolders, func(i, j int) bool {
-			return group.VirtualFolders[i].Name < group.VirtualFolders[j].Name
-		})
 		for idx := range group.VirtualFolders {
 			err = p.addRelationToFolderMapping(group.VirtualFolders[idx].Name, nil, group, foldersBucket)
 			if err != nil {
@@ -1549,9 +1470,6 @@ func (p *BoltProvider) updateGroup(group *Group) error {
 				return err
 			}
 		}
-		sort.Slice(group.VirtualFolders, func(i, j int) bool {
-			return group.VirtualFolders[i].Name < group.VirtualFolders[j].Name
-		})
 		for idx := range group.VirtualFolders {
 			err = p.addRelationToFolderMapping(group.VirtualFolders[idx].Name, nil, group, foldersBucket)
 			if err != nil {
@@ -1586,7 +1504,7 @@ func (p *BoltProvider) deleteGroup(group Group) error {
 		if err != nil {
 			return err
 		}
-		if len(oldGroup.Users) > 0 {
+		if len(oldGroup.Users) > 0 || len(oldGroup.Admins) > 0 {
 			return util.NewValidationError(fmt.Sprintf("the group %q is referenced, it cannot be removed", oldGroup.Name))
 		}
 		if len(oldGroup.VirtualFolders) > 0 {
@@ -1596,18 +1514,6 @@ func (p *BoltProvider) deleteGroup(group Group) error {
 			}
 			for idx := range oldGroup.VirtualFolders {
 				err = p.removeRelationFromFolderMapping(oldGroup.VirtualFolders[idx], "", oldGroup.Name, foldersBucket)
-				if err != nil {
-					return err
-				}
-			}
-		}
-		if len(oldGroup.Admins) > 0 {
-			adminsBucket, err := p.getAdminsBucket(tx)
-			if err != nil {
-				return err
-			}
-			for idx := range oldGroup.Admins {
-				err = p.removeGroupFromAdminMapping(oldGroup.Name, oldGroup.Admins[idx], adminsBucket)
 				if err != nil {
 					return err
 				}
@@ -2061,6 +1967,9 @@ func (p *BoltProvider) updateShareLastUse(shareID string, numTokens int) error {
 		err = json.Unmarshal(u, &share)
 		if err != nil {
 			return err
+		}
+		if numTokens > 0 && share.MaxTokens > 0 && share.UsedTokens+numTokens > share.MaxTokens {
+			return ErrShareUsageExceeded
 		}
 		share.LastUseAt = util.GetTimeAsMsSinceEpoch(time.Now())
 		share.UsedTokens += numTokens
@@ -2750,19 +2659,8 @@ func (p *BoltProvider) deleteRole(role Role) error {
 		if err != nil {
 			return err
 		}
-		if len(oldRole.Admins) > 0 {
+		if len(oldRole.Admins) > 0 || len(oldRole.Users) > 0 {
 			return util.NewValidationError(fmt.Sprintf("the role %q is referenced, it cannot be removed", oldRole.Name))
-		}
-		if len(oldRole.Users) > 0 {
-			bucket, err := p.getUsersBucket(tx)
-			if err != nil {
-				return err
-			}
-			for _, username := range oldRole.Users {
-				if err := p.removeRoleFromUser(username, oldRole.Name, bucket); err != nil {
-					return err
-				}
-			}
 		}
 
 		return bucket.Delete([]byte(role.Name))
@@ -2936,7 +2834,7 @@ func (p *BoltProvider) getIPListEntries(listType IPListType, filter, from, order
 		if err != nil {
 			return err
 		}
-		prefix := []byte(fmt.Sprintf("%d_", listType))
+		prefix := []byte(listType.keyPrefix())
 		acceptKey := func(k []byte) bool {
 			return k != nil && bytes.HasPrefix(k, prefix)
 		}
@@ -2988,9 +2886,8 @@ func (p *BoltProvider) dumpIPListEntries() ([]IPListEntry, error) {
 		if err != nil {
 			return err
 		}
-		if count := bucket.Stats().KeyN; count > ipListMemoryLimit {
-			providerLog(logger.LevelInfo, "IP lists excluded from dump, too many entries: %d", count)
-			return nil
+		if count := bucket.Stats().KeyN; count > ipListDumpLimit {
+			return errTooManyIPListEntries(int64(count))
 		}
 		cursor := bucket.Cursor()
 		for k, v := cursor.First(); k != nil; k, v = cursor.Next() {
@@ -3018,7 +2915,7 @@ func (p *BoltProvider) countIPListEntries(listType IPListType) (int64, error) {
 			count = int64(bucket.Stats().KeyN)
 			return nil
 		}
-		prefix := []byte(fmt.Sprintf("%d_", listType))
+		prefix := []byte(listType.keyPrefix())
 		cursor := bucket.Cursor()
 		for k, _ := cursor.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, _ = cursor.Next() {
 			count++
@@ -3050,7 +2947,7 @@ func (p *BoltProvider) getListEntriesForIP(ip string, listType IPListType) ([]IP
 		if err != nil {
 			return err
 		}
-		prefix := []byte(fmt.Sprintf("%d_", listType))
+		prefix := []byte(listType.keyPrefix())
 		cursor := bucket.Cursor()
 		for k, v := cursor.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, v = cursor.Next() {
 			var entry IPListEntry
@@ -3180,18 +3077,16 @@ func (p *BoltProvider) migrateDatabase() error {
 	case version == boltDatabaseVersion:
 		providerLog(logger.LevelDebug, "bolt database is up to date, current version: %d", version)
 		return ErrNoInitRequired
-	case version < 29:
+	case version < 33:
 		err = errSchemaVersionTooOld(version)
 		providerLog(logger.LevelError, "%v", err)
 		logger.ErrorToConsole("%v", err)
 		return err
-	case version == 29, version == 30, version == 31:
-		logger.InfoToConsole("updating database schema version: %d -> 32", version)
-		providerLog(logger.LevelInfo, "updating database schema version: %d -> 32", version)
-		if err := updateEventActions(); err != nil {
-			return err
-		}
-		return updateBoltDatabaseVersion(p.dbHandle, 32)
+	case version == 33, version == 34, version == 35:
+		logger.InfoToConsole("updating database schema version: %d -> 36", version)
+		providerLog(logger.LevelInfo, "updating database schema version: %d -> 36", version)
+		return updateBoltDatabaseVersion(p.dbHandle, 36)
+
 	default:
 		if version > boltDatabaseVersion {
 			providerLog(logger.LevelError, "database schema version %d is newer than the supported one: %d", version,
@@ -3204,7 +3099,7 @@ func (p *BoltProvider) migrateDatabase() error {
 	}
 }
 
-func (p *BoltProvider) revertDatabase(targetVersion int) error { //nolint:gocyclo
+func (p *BoltProvider) revertDatabase(targetVersion int) error {
 	dbVersion, err := getBoltDatabaseVersion(p.dbHandle)
 	if err != nil {
 		return err
@@ -3213,15 +3108,11 @@ func (p *BoltProvider) revertDatabase(targetVersion int) error { //nolint:gocycl
 		return errors.New("current version match target version, nothing to do")
 	}
 	switch dbVersion.Version {
-	case 30, 31, 32:
-		logger.InfoToConsole("downgrading database schema version: %d -> 29", dbVersion.Version)
-		providerLog(logger.LevelInfo, "downgrading database schema version: %d -> 29", dbVersion.Version)
-		if dbVersion.Version == 32 {
-			if err := restoreEventActions(); err != nil {
-				return err
-			}
-		}
-		return updateBoltDatabaseVersion(p.dbHandle, 29)
+	case 34, 35, 36:
+		logger.InfoToConsole("downgrading database schema version: %d -> 33", dbVersion.Version)
+		providerLog(logger.LevelInfo, "downgrading database schema version: %d -> 33", dbVersion.Version)
+		return updateBoltDatabaseVersion(p.dbHandle, 33)
+
 	default:
 		return fmt.Errorf("database schema version not handled: %v", dbVersion.Version)
 	}
@@ -3344,29 +3235,6 @@ func (p *BoltProvider) addFolderInternal(folder vfs.BaseVirtualFolder, bucket *b
 		return err
 	}
 	return bucket.Put([]byte(folder.Name), buf)
-}
-
-func (p *BoltProvider) removeRoleFromUser(username, role string, bucket *bolt.Bucket) error {
-	u := bucket.Get([]byte(username))
-	if u == nil {
-		providerLog(logger.LevelWarn, "user %q does not exist, cannot remove role %q", username, role)
-		return nil
-	}
-	var user User
-	err := json.Unmarshal(u, &user)
-	if err != nil {
-		return err
-	}
-	if user.Role == role {
-		user.Role = ""
-		buf, err := json.Marshal(user)
-		if err != nil {
-			return err
-		}
-		return bucket.Put([]byte(user.Username), buf)
-	}
-	providerLog(logger.LevelError, "user %q does not have the expected role %q, actual %q", username, role, user.Role)
-	return nil
 }
 
 func (p *BoltProvider) addAdminToRole(username, roleName string, bucket *bolt.Bucket) error {
@@ -3619,31 +3487,6 @@ func (p *BoltProvider) removeAdminFromGroupMapping(username, groupname string, b
 	return bucket.Put([]byte(group.Name), buf)
 }
 
-func (p *BoltProvider) removeGroupFromAdminMapping(groupName, adminName string, bucket *bolt.Bucket) error {
-	var a []byte
-	if a = bucket.Get([]byte(adminName)); a == nil {
-		// the admin does not exist so there is no associated group
-		return nil
-	}
-	var admin Admin
-	err := json.Unmarshal(a, &admin)
-	if err != nil {
-		return err
-	}
-	var newGroups []AdminGroupMapping
-	for _, g := range admin.Groups {
-		if g.Name != groupName {
-			newGroups = append(newGroups, g)
-		}
-	}
-	admin.Groups = newGroups
-	buf, err := json.Marshal(admin)
-	if err != nil {
-		return err
-	}
-	return bucket.Put([]byte(adminName), buf)
-}
-
 func (p *BoltProvider) addRelationToFolderMapping(folderName string, user *User, group *Group, bucket *bolt.Bucket) error {
 	f := bucket.Get([]byte(folderName))
 	if f == nil {
@@ -3745,18 +3588,12 @@ func (p *BoltProvider) updateUserRelations(tx *bolt.Tx, user *User, oldUser User
 	if err = p.removeUserFromRole(oldUser.Username, oldUser.Role, rolesBucket); err != nil {
 		return err
 	}
-	sort.Slice(user.VirtualFolders, func(i, j int) bool {
-		return user.VirtualFolders[i].Name < user.VirtualFolders[j].Name
-	})
 	for idx := range user.VirtualFolders {
 		err = p.addRelationToFolderMapping(user.VirtualFolders[idx].Name, user, nil, foldersBucket)
 		if err != nil {
 			return err
 		}
 	}
-	sort.Slice(user.Groups, func(i, j int) bool {
-		return user.Groups[i].Name < user.Groups[j].Name
-	})
 	for idx := range user.Groups {
 		err = p.addUserToGroupMapping(user.Username, user.Groups[idx].Name, groupsBucket)
 		if err != nil {
@@ -3953,7 +3790,7 @@ func getBoltDatabaseVersion(dbHandle *bolt.DB) (schemaVersion, error) {
 		v := bucket.Get(dbVersionKey)
 		if v == nil {
 			dbVersion = schemaVersion{
-				Version: 29,
+				Version: 33,
 			}
 			return nil
 		}

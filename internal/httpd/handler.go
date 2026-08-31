@@ -35,6 +35,17 @@ import (
 type Connection struct {
 	*common.BaseConnection
 	request *http.Request
+	rc      *http.ResponseController
+}
+
+func newConnection(conn *common.BaseConnection, w http.ResponseWriter, r *http.Request) *Connection {
+	rc := http.NewResponseController(w)
+	responseControllerDeadlines(rc, time.Time{}, time.Time{})
+	return &Connection{
+		BaseConnection: conn,
+		request:        r,
+		rc:             rc,
+	}
 }
 
 // GetClientVersion returns the connected client's version.
@@ -60,6 +71,9 @@ func (c *Connection) GetRemoteAddress() string {
 
 // Disconnect closes the active transfer
 func (c *Connection) Disconnect() (err error) {
+	if c.rc != nil {
+		responseControllerDeadlines(c.rc, time.Now().Add(5*time.Second), time.Now().Add(5*time.Second))
+	}
 	return c.SignalTransfersAbort()
 }
 
@@ -97,7 +111,7 @@ func (c *Connection) ReadDir(name string) (vfs.DirLister, error) {
 func (c *Connection) getFileReader(name string, offset int64, method string) (io.ReadCloser, error) {
 	c.UpdateLastActivity()
 
-	if err := common.Connections.IsNewTransferAllowed(c.User.Username); err != nil {
+	if err := common.Connections.IsNewTransferAllowed(c.BaseConnection); err != nil {
 		c.Log(logger.LevelInfo, "denying file read due to transfer count limits")
 		return nil, util.NewI18nError(c.GetPermissionDeniedError(), util.I18nError403Message)
 	}
@@ -193,7 +207,7 @@ func (c *Connection) getFileWriter(name string) (io.WriteCloser, error) {
 }
 
 func (c *Connection) handleUploadFile(fs vfs.Fs, resolvedPath, filePath, requestPath string, isNewFile bool, fileSize int64) (io.WriteCloser, error) {
-	if err := common.Connections.IsNewTransferAllowed(c.User.Username); err != nil {
+	if err := common.Connections.IsNewTransferAllowed(c.BaseConnection); err != nil {
 		c.Log(logger.LevelInfo, "denying file write due to transfer count limits")
 		return nil, util.NewI18nError(c.GetPermissionDeniedError(), util.I18nError403Message)
 	}
@@ -224,7 +238,7 @@ func (c *Connection) handleUploadFile(fs vfs.Fs, resolvedPath, filePath, request
 			if err == nil {
 				dataprovider.UpdateUserFolderQuota(&vfolder, &c.User, 0, -fileSize, false)
 			} else {
-				dataprovider.UpdateUserQuota(&c.User, 0, -fileSize, false) //nolint:errcheck
+				_ = dataprovider.UpdateUserQuota(&c.User, 0, -fileSize, false)
 			}
 		} else {
 			initialSize = fileSize
@@ -254,6 +268,14 @@ func newThrottledReader(r io.ReadCloser, limit int64, conn *Connection) *throttl
 	t.abortTransfer.Store(false)
 	conn.AddTransfer(t)
 	return t
+}
+
+func parseUploadMultipartForm(connection *Connection, r *http.Request) error {
+	t := newThrottledReader(r.Body, connection.User.UploadBandwidth, connection)
+	defer connection.RemoveTransfer(t)
+
+	r.Body = t
+	return r.ParseMultipartForm(maxMultipartMem)
 }
 
 type throttledReader struct {
@@ -326,6 +348,10 @@ func (t *throttledReader) Truncate(_ string, _ int64) (int64, error) {
 }
 
 func (t *throttledReader) GetRealFsPath(_ string) string {
+	return ""
+}
+
+func (t *throttledReader) GetFsPath() string {
 	return ""
 }
 

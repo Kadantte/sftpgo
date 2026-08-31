@@ -27,6 +27,7 @@ import (
 	"github.com/sftpgo/sdk/plugin/notifier"
 
 	"github.com/drakkan/sftpgo/v2/internal/dataprovider"
+	"github.com/drakkan/sftpgo/v2/internal/jwt"
 	"github.com/drakkan/sftpgo/v2/internal/plugin"
 	"github.com/drakkan/sftpgo/v2/internal/util"
 )
@@ -143,7 +144,7 @@ func getLogSearchParamsFromRequest(r *http.Request) (eventsearcher.LogEventSearc
 
 func searchFsEvents(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestSize)
-	claims, err := getTokenClaims(r)
+	claims, err := jwt.FromContext(r.Context())
 	if err != nil || claims.Username == "" {
 		sendAPIResponse(w, r, err, "Invalid token claims", http.StatusBadRequest)
 		return
@@ -171,12 +172,12 @@ func searchFsEvents(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	w.Write(data) //nolint:errcheck
+	_, _ = w.Write(data)
 }
 
 func searchProviderEvents(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestSize)
-	claims, err := getTokenClaims(r)
+	claims, err := jwt.FromContext(r.Context())
 	if err != nil || claims.Username == "" {
 		sendAPIResponse(w, r, err, "Invalid token claims", http.StatusBadRequest)
 		return
@@ -206,12 +207,12 @@ func searchProviderEvents(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	w.Write(data) //nolint:errcheck
+	_, _ = w.Write(data)
 }
 
 func searchLogEvents(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestSize)
-	claims, err := getTokenClaims(r)
+	claims, err := jwt.FromContext(r.Context())
 	if err != nil || claims.Username == "" {
 		sendAPIResponse(w, r, err, "Invalid token claims", http.StatusBadRequest)
 		return
@@ -239,7 +240,7 @@ func searchLogEvents(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	w.Write(data) //nolint:errcheck
+	_, _ = w.Write(data)
 }
 
 func exportFsEvents(w http.ResponseWriter, filters *eventsearcher.FsEventSearch) error {
@@ -381,21 +382,26 @@ type fsEvent struct {
 	Endpoint          string `json:"endpoint,omitempty"`
 	OpenFlags         int    `json:"open_flags,omitempty"`
 	Role              string `json:"role,omitempty"`
-	InstanceID        string `json:"instance_id,omitempty"`
 }
 
 func (e *fsEvent) getCSVHeader() []string {
-	return []string{"Time", "Action", "Path", "Size", "Elapsed", "Status", "User", "Protocol",
-		"IP", "SSH command"}
+	return []string{"Time", "Action", "Path", "Fs Path", "Size", "Elapsed", "Status", "User", "Protocol",
+		"IP", "SSH command", "Role"}
 }
 
 func (e *fsEvent) getCSVData() []string {
 	timestamp := time.Unix(0, e.Timestamp).UTC()
 	var pathInfo strings.Builder
-	pathInfo.Write([]byte(e.VirtualPath))
+	pathInfo.WriteString(e.VirtualPath)
 	if e.VirtualTargetPath != "" {
 		pathInfo.WriteString(" => ")
 		pathInfo.WriteString(e.VirtualTargetPath)
+	}
+	var fsPathInfo strings.Builder
+	fsPathInfo.WriteString(e.FsPath)
+	if e.FsTargetPath != "" {
+		fsPathInfo.WriteString(" => ")
+		fsPathInfo.WriteString(e.FsTargetPath)
 	}
 	var status string
 	switch e.Status {
@@ -414,8 +420,8 @@ func (e *fsEvent) getCSVData() []string {
 	if e.Elapsed > 0 {
 		elapsed = (time.Duration(e.Elapsed) * time.Millisecond).String()
 	}
-	return []string{timestamp.Format(time.RFC3339Nano), e.Action, pathInfo.String(),
-		fileSize, elapsed, status, e.Username, e.Protocol, e.IP, e.SSHCmd}
+	return util.SanitizeCSVRow([]string{timestamp.Format(time.RFC3339Nano), e.Action, pathInfo.String(), fsPathInfo.String(),
+		fileSize, elapsed, status, e.Username, e.Protocol, e.IP, e.SSHCmd, e.Role})
 }
 
 type providerEvent struct {
@@ -428,17 +434,16 @@ type providerEvent struct {
 	ObjectName string `json:"object_name"`
 	ObjectData []byte `json:"object_data"`
 	Role       string `json:"role,omitempty"`
-	InstanceID string `json:"instance_id,omitempty"`
 }
 
 func (e *providerEvent) getCSVHeader() []string {
-	return []string{"Time", "Action", "Object Type", "Object Name", "User", "IP"}
+	return []string{"Time", "Action", "Object Type", "Object Name", "User", "IP", "Role"}
 }
 
 func (e *providerEvent) getCSVData() []string {
 	timestamp := time.Unix(0, e.Timestamp).UTC()
-	return []string{timestamp.Format(time.RFC3339Nano), e.Action, e.ObjectType, e.ObjectName,
-		e.Username, e.IP}
+	return util.SanitizeCSVRow([]string{timestamp.Format(time.RFC3339Nano), e.Action, e.ObjectType, e.ObjectName,
+		e.Username, e.IP, e.Role})
 }
 
 type logEvent struct {
@@ -453,13 +458,13 @@ type logEvent struct {
 }
 
 func (e *logEvent) getCSVHeader() []string {
-	return []string{"Time", "Event", "Protocol", "User", "IP", "Message"}
+	return []string{"Time", "Event", "Protocol", "User", "IP", "Message", "Role"}
 }
 
 func (e *logEvent) getCSVData() []string {
 	timestamp := time.Unix(0, e.Timestamp).UTC()
-	return []string{timestamp.Format(time.RFC3339Nano), getLogEventString(notifier.LogEventType(e.Event)),
-		e.Protocol, e.Username, e.IP, e.Message}
+	return util.SanitizeCSVRow([]string{timestamp.Format(time.RFC3339Nano), getLogEventString(notifier.LogEventType(e.Event)),
+		e.Protocol, e.Username, e.IP, e.Message, e.Role})
 }
 
 func getLogEventString(event notifier.LogEventType) string {

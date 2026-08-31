@@ -16,6 +16,7 @@ package httpd
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -31,14 +32,15 @@ import (
 	"strings"
 	"time"
 
-	"github.com/rs/xid"
 	"github.com/sftpgo/sdk"
 	sdkkms "github.com/sftpgo/sdk/kms"
+	"golang.org/x/oauth2"
 
 	"github.com/drakkan/sftpgo/v2/internal/acme"
 	"github.com/drakkan/sftpgo/v2/internal/common"
 	"github.com/drakkan/sftpgo/v2/internal/dataprovider"
 	"github.com/drakkan/sftpgo/v2/internal/ftpd"
+	"github.com/drakkan/sftpgo/v2/internal/jwt"
 	"github.com/drakkan/sftpgo/v2/internal/kms"
 	"github.com/drakkan/sftpgo/v2/internal/logger"
 	"github.com/drakkan/sftpgo/v2/internal/mfa"
@@ -73,37 +75,36 @@ const (
 )
 
 const (
-	templateAdminDir         = "webadmin"
-	templateBase             = "base.html"
-	templateFsConfig         = "fsconfig.html"
-	templateSharedComponents = "sharedcomponents.html"
-	templateUsers            = "users.html"
-	templateUser             = "user.html"
-	templateAdmins           = "admins.html"
-	templateAdmin            = "admin.html"
-	templateConnections      = "connections.html"
-	templateGroups           = "groups.html"
-	templateGroup            = "group.html"
-	templateFolders          = "folders.html"
-	templateFolder           = "folder.html"
-	templateEventRules       = "eventrules.html"
-	templateEventRule        = "eventrule.html"
-	templateEventActions     = "eventactions.html"
-	templateEventAction      = "eventaction.html"
-	templateRoles            = "roles.html"
-	templateRole             = "role.html"
-	templateEvents           = "events.html"
-	templateStatus           = "status.html"
-	templateDefender         = "defender.html"
-	templateIPLists          = "iplists.html"
-	templateIPList           = "iplist.html"
-	templateConfigs          = "configs.html"
-	templateProfile          = "profile.html"
-	templateMaintenance      = "maintenance.html"
-	templateMFA              = "mfa.html"
-	templateSetup            = "adminsetup.html"
-	defaultQueryLimit        = 1000
-	inversePatternType       = "inverse"
+	templateAdminDir     = "webadmin"
+	templateBase         = "base.html"
+	templateFsConfig     = "fsconfig.html"
+	templateUsers        = "users.html"
+	templateUser         = "user.html"
+	templateAdmins       = "admins.html"
+	templateAdmin        = "admin.html"
+	templateConnections  = "connections.html"
+	templateGroups       = "groups.html"
+	templateGroup        = "group.html"
+	templateFolders      = "folders.html"
+	templateFolder       = "folder.html"
+	templateEventRules   = "eventrules.html"
+	templateEventRule    = "eventrule.html"
+	templateEventActions = "eventactions.html"
+	templateEventAction  = "eventaction.html"
+	templateRoles        = "roles.html"
+	templateRole         = "role.html"
+	templateEvents       = "events.html"
+	templateStatus       = "status.html"
+	templateDefender     = "defender.html"
+	templateIPLists      = "iplists.html"
+	templateIPList       = "iplist.html"
+	templateConfigs      = "configs.html"
+	templateProfile      = "profile.html"
+	templateMaintenance  = "maintenance.html"
+	templateMFA          = "mfa.html"
+	templateSetup        = "adminsetup.html"
+	defaultQueryLimit    = 1000
+	inversePatternType   = "inverse"
 )
 
 var (
@@ -211,7 +212,8 @@ type profilePage struct {
 
 type changePasswordPage struct {
 	basePage
-	Error *util.I18nError
+	Error          *util.I18nError
+	RequiredAction *util.I18nError
 }
 
 type mfaPage struct {
@@ -223,6 +225,7 @@ type mfaPage struct {
 	SaveTOTPURL      string
 	RecCodesURL      string
 	RequireTwoFactor bool
+	RequiredAction   *util.I18nError
 }
 
 type maintenancePage struct {
@@ -727,7 +730,7 @@ func (s *httpdServer) renderForgotPwdPage(w http.ResponseWriter, r *http.Request
 		commonBasePage: getCommonBasePage(r),
 		CurrentURL:     webAdminForgotPwdPath,
 		Error:          err,
-		CSRFToken:      createCSRFToken(w, r, s.csrfTokenAuth, xid.New().String(), webBaseAdminPath),
+		CSRFToken:      createCSRFToken(w, r, s.csrfTokenAuth, rand.Text(), webBaseAdminPath),
 		LoginURL:       webAdminLoginPath,
 		Title:          util.I18nForgotPwdTitle,
 		Branding:       s.binding.webAdminBranding(),
@@ -793,6 +796,12 @@ func (s *httpdServer) renderMFAPage(w http.ResponseWriter, r *http.Request) {
 	}
 	data.TOTPConfig = admin.Filters.TOTPConfig
 	data.RequireTwoFactor = admin.Filters.RequireTwoFactor
+	if claims, claimsErr := jwt.FromContext(r.Context()); claimsErr == nil && claims.MustSetTwoFactorAuth {
+		data.RequiredAction = util.NewI18nError(
+			util.NewGenericError("Two-factor authentication setup required"),
+			util.I18nError2FARequiredGeneric,
+		)
+	}
 	renderAdminTemplate(w, templateMFA, data)
 }
 
@@ -818,7 +827,12 @@ func (s *httpdServer) renderChangePasswordPage(w http.ResponseWriter, r *http.Re
 		basePage: s.getBasePageData(util.I18nChangePwdTitle, webChangeAdminPwdPath, w, r),
 		Error:    err,
 	}
-
+	if claims, claimsErr := jwt.FromContext(r.Context()); claimsErr == nil && claims.MustChangePassword {
+		data.RequiredAction = util.NewI18nError(
+			util.NewGenericError("Password change required"),
+			util.I18nErrorChangePwdRequired,
+		)
+	}
 	renderAdminTemplate(w, templateChangePwd, data)
 }
 
@@ -864,7 +878,7 @@ func (s *httpdServer) renderAdminSetupPage(w http.ResponseWriter, r *http.Reques
 		commonBasePage:       getCommonBasePage(r),
 		Title:                util.I18nSetupTitle,
 		CurrentURL:           webAdminSetupPath,
-		CSRFToken:            createCSRFToken(w, r, s.csrfTokenAuth, xid.New().String(), webBaseAdminPath),
+		CSRFToken:            createCSRFToken(w, r, s.csrfTokenAuth, rand.Text(), webBaseAdminPath),
 		Username:             username,
 		HasInstallationCode:  installationCode != "",
 		InstallationCodeHint: installationCodeHint,
@@ -1242,6 +1256,7 @@ func getVirtualFoldersFromPostFields(r *http.Request) []vfs.VirtualFolder {
 	folderNames := r.Form["vfolder_name"]
 	folderQuotaSizes := r.Form["vfolder_quota_size"]
 	folderQuotaFiles := r.Form["vfolder_quota_files"]
+	folderSubpaths := r.Form["vfolder_subpath"]
 	for idx, p := range folderPaths {
 		name := ""
 		if len(folderNames) > idx {
@@ -1267,6 +1282,9 @@ func getVirtualFoldersFromPostFields(r *http.Request) []vfs.VirtualFolder {
 				if err == nil {
 					vfolder.QuotaFiles = quotaFiles
 				}
+			}
+			if len(folderSubpaths) > idx {
+				vfolder.Subpath = folderSubpaths[idx]
 			}
 			virtualFolders = append(virtualFolders, vfolder)
 		}
@@ -1549,7 +1567,7 @@ func getS3Config(r *http.Request) (vfs.S3FsConfig, error) {
 	config.Endpoint = strings.TrimSpace(r.Form.Get("s3_endpoint"))
 	config.StorageClass = strings.TrimSpace(r.Form.Get("s3_storage_class"))
 	config.ACL = strings.TrimSpace(r.Form.Get("s3_acl"))
-	config.KeyPrefix = strings.TrimSpace(strings.TrimPrefix(r.Form.Get("s3_key_prefix"), "/"))
+	config.KeyPrefix = strings.TrimSpace(r.Form.Get("s3_key_prefix"))
 	config.UploadPartSize, err = strconv.ParseInt(r.Form.Get("s3_upload_part_size"), 10, 64)
 	if err != nil {
 		return config, fmt.Errorf("invalid s3 upload part size: %w", err)
@@ -1586,7 +1604,7 @@ func getGCSConfig(r *http.Request) (vfs.GCSFsConfig, error) {
 	config.Bucket = strings.TrimSpace(r.Form.Get("gcs_bucket"))
 	config.StorageClass = strings.TrimSpace(r.Form.Get("gcs_storage_class"))
 	config.ACL = strings.TrimSpace(r.Form.Get("gcs_acl"))
-	config.KeyPrefix = strings.TrimSpace(strings.TrimPrefix(r.Form.Get("gcs_key_prefix"), "/"))
+	config.KeyPrefix = strings.TrimSpace(r.Form.Get("gcs_key_prefix"))
 	uploadPartSize, err := strconv.ParseInt(r.Form.Get("gcs_upload_part_size"), 10, 64)
 	if err == nil {
 		config.UploadPartSize = uploadPartSize
@@ -1616,7 +1634,7 @@ func getGCSConfig(r *http.Request) (vfs.GCSFsConfig, error) {
 		}
 		return config, err
 	}
-	config.Credentials = kms.NewPlainSecret(util.BytesToString(fileBytes))
+	config.Credentials = kms.NewPlainSecret(string(fileBytes))
 	config.AutomaticCredentials = 0
 	return config, err
 }
@@ -1668,7 +1686,7 @@ func getAzureConfig(r *http.Request) (vfs.AzBlobFsConfig, error) {
 	config.AccountKey = getSecretFromFormField(r, "az_account_key")
 	config.SASURL = getSecretFromFormField(r, "az_sas_url")
 	config.Endpoint = strings.TrimSpace(r.Form.Get("az_endpoint"))
-	config.KeyPrefix = strings.TrimSpace(strings.TrimPrefix(r.Form.Get("az_key_prefix"), "/"))
+	config.KeyPrefix = strings.TrimSpace(r.Form.Get("az_key_prefix"))
 	config.AccessTier = strings.TrimSpace(r.Form.Get("az_access_tier"))
 	config.UseEmulator = r.Form.Get("az_use_emulator") != ""
 	config.UploadPartSize, err = strconv.ParseInt(r.Form.Get("az_upload_part_size"), 10, 64)
@@ -1925,6 +1943,7 @@ func getUserFromTemplate(user dataprovider.User, template userTemplateFields) da
 	for _, vfolder := range user.VirtualFolders {
 		vfolder.Name = replacePlaceholders(vfolder.Name, replacements)
 		vfolder.VirtualPath = replacePlaceholders(vfolder.VirtualPath, replacements)
+		vfolder.Subpath = replacePlaceholders(vfolder.Subpath, replacements)
 		vfolders = append(vfolders, vfolder)
 	}
 	user.VirtualFolders = vfolders
@@ -2007,6 +2026,7 @@ func updateRepeaterFormFields(r *http.Request) {
 			r.Form.Add("vfolder_name", strings.TrimSpace(r.Form.Get(base+"[vfolder_name]")))
 			r.Form.Add("vfolder_quota_files", strings.TrimSpace(r.Form.Get(base+"[vfolder_quota_files]")))
 			r.Form.Add("vfolder_quota_size", strings.TrimSpace(r.Form.Get(base+"[vfolder_quota_size]")))
+			r.Form.Add("vfolder_subpath", strings.TrimSpace(r.Form.Get(base+"[vfolder_subpath]")))
 			continue
 		}
 		if hasPrefixAndSuffix(k, "directory_permissions[", "][sub_perm_path]") {
@@ -2053,7 +2073,7 @@ func getUserFromPostFields(r *http.Request) (dataprovider.User, error) {
 	if err != nil {
 		return user, util.NewI18nError(err, util.I18nErrorInvalidForm)
 	}
-	defer r.MultipartForm.RemoveAll() //nolint:errcheck
+	defer r.MultipartForm.RemoveAll()
 
 	updateRepeaterFormFields(r)
 
@@ -2149,7 +2169,7 @@ func getGroupFromPostFields(r *http.Request) (dataprovider.Group, error) {
 	if err != nil {
 		return group, util.NewI18nError(err, util.I18nErrorInvalidForm)
 	}
-	defer r.MultipartForm.RemoveAll() //nolint:errcheck
+	defer r.MultipartForm.RemoveAll()
 
 	updateRepeaterFormFields(r)
 
@@ -2965,7 +2985,7 @@ func (s *httpdServer) handleWebAdminProfilePost(w http.ResponseWriter, r *http.R
 		s.renderForbiddenPage(w, r, util.NewI18nError(err, util.I18nErrorInvalidCSRF))
 		return
 	}
-	claims, err := getTokenClaims(r)
+	claims, err := jwt.FromContext(r.Context())
 	if err != nil || claims.Username == "" {
 		s.renderProfilePage(w, r, util.NewI18nError(err, util.I18nErrorInvalidToken))
 		return
@@ -2993,7 +3013,7 @@ func (s *httpdServer) handleWebMaintenance(w http.ResponseWriter, r *http.Reques
 
 func (s *httpdServer) handleWebRestore(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, MaxRestoreSize)
-	claims, err := getTokenClaims(r)
+	claims, err := jwt.FromContext(r.Context())
 	if err != nil || claims.Username == "" {
 		s.renderForbiddenPage(w, r, util.NewI18nError(errInvalidTokenClaims, util.I18nErrorInvalidToken))
 		return
@@ -3003,7 +3023,7 @@ func (s *httpdServer) handleWebRestore(w http.ResponseWriter, r *http.Request) {
 		s.renderMaintenancePage(w, r, util.NewI18nError(err, util.I18nErrorInvalidForm))
 		return
 	}
-	defer r.MultipartForm.RemoveAll() //nolint:errcheck
+	defer r.MultipartForm.RemoveAll()
 
 	ipAddr := util.GetIPFromRemoteAddress(r.RemoteAddr)
 	if err := verifyCSRFToken(r, s.csrfTokenAuth); err != nil {
@@ -3046,7 +3066,7 @@ func (s *httpdServer) handleWebRestore(w http.ResponseWriter, r *http.Request) {
 
 func getAllAdmins(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestSize)
-	claims, err := getTokenClaims(r)
+	claims, err := jwt.FromContext(r.Context())
 	if err != nil || claims.Username == "" {
 		sendAPIResponse(w, r, nil, util.I18nErrorInvalidToken, http.StatusForbidden)
 		return
@@ -3104,7 +3124,7 @@ func (s *httpdServer) handleWebUpdateAdminGet(w http.ResponseWriter, r *http.Req
 
 func (s *httpdServer) handleWebAddAdminPost(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestSize)
-	claims, err := getTokenClaims(r)
+	claims, err := jwt.FromContext(r.Context())
 	if err != nil || claims.Username == "" {
 		s.renderForbiddenPage(w, r, util.NewI18nError(errInvalidTokenClaims, util.I18nErrorInvalidToken))
 		return
@@ -3164,7 +3184,7 @@ func (s *httpdServer) handleWebUpdateAdminPost(w http.ResponseWriter, r *http.Re
 	}
 	updatedAdmin.Filters.TOTPConfig = admin.Filters.TOTPConfig
 	updatedAdmin.Filters.RecoveryCodes = admin.Filters.RecoveryCodes
-	claims, err := getTokenClaims(r)
+	claims, err := jwt.FromContext(r.Context())
 	if err != nil || claims.Username == "" {
 		s.renderAddUpdateAdminPage(w, r, &updatedAdmin, util.NewI18nError(errInvalidTokenClaims, util.I18nErrorInvalidToken), false)
 		return
@@ -3215,7 +3235,7 @@ func (s *httpdServer) handleWebDefenderPage(w http.ResponseWriter, r *http.Reque
 
 func getAllUsers(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestSize)
-	claims, err := getTokenClaims(r)
+	claims, err := jwt.FromContext(r.Context())
 	if err != nil || claims.Username == "" {
 		sendAPIResponse(w, r, nil, util.I18nErrorInvalidToken, http.StatusForbidden)
 		return
@@ -3235,7 +3255,7 @@ func getAllUsers(w http.ResponseWriter, r *http.Request) {
 
 func (s *httpdServer) handleGetWebUsers(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestSize)
-	claims, err := getTokenClaims(r)
+	claims, err := jwt.FromContext(r.Context())
 	if err != nil || claims.Username == "" {
 		s.renderForbiddenPage(w, r, util.NewI18nError(errInvalidTokenClaims, util.I18nErrorInvalidToken))
 		return
@@ -3265,7 +3285,7 @@ func (s *httpdServer) handleWebTemplateFolderGet(w http.ResponseWriter, r *http.
 
 func (s *httpdServer) handleWebTemplateFolderPost(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestSize)
-	claims, err := getTokenClaims(r)
+	claims, err := jwt.FromContext(r.Context())
 	if err != nil || claims.Username == "" {
 		s.renderForbiddenPage(w, r, util.NewI18nError(errInvalidTokenClaims, util.I18nErrorInvalidToken))
 		return
@@ -3276,7 +3296,7 @@ func (s *httpdServer) handleWebTemplateFolderPost(w http.ResponseWriter, r *http
 		s.renderMessagePage(w, r, util.I18nTemplateFolderTitle, http.StatusBadRequest, util.NewI18nError(err, util.I18nErrorInvalidForm), "")
 		return
 	}
-	defer r.MultipartForm.RemoveAll() //nolint:errcheck
+	defer r.MultipartForm.RemoveAll()
 
 	ipAddr := util.GetIPFromRemoteAddress(r.RemoteAddr)
 	if err := verifyCSRFToken(r, s.csrfTokenAuth); err != nil {
@@ -3362,7 +3382,7 @@ func (s *httpdServer) handleWebTemplateUserGet(w http.ResponseWriter, r *http.Re
 
 func (s *httpdServer) handleWebTemplateUserPost(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestSize)
-	claims, err := getTokenClaims(r)
+	claims, err := jwt.FromContext(r.Context())
 	if err != nil || claims.Username == "" {
 		s.renderForbiddenPage(w, r, util.NewI18nError(errInvalidTokenClaims, util.I18nErrorInvalidToken))
 		return
@@ -3430,7 +3450,7 @@ func (s *httpdServer) handleWebAddUserGet(w http.ResponseWriter, r *http.Request
 
 func (s *httpdServer) handleWebUpdateUserGet(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestSize)
-	claims, err := getTokenClaims(r)
+	claims, err := jwt.FromContext(r.Context())
 	if err != nil || claims.Username == "" {
 		s.renderForbiddenPage(w, r, util.NewI18nError(errInvalidTokenClaims, util.I18nErrorInvalidToken))
 		return
@@ -3448,7 +3468,7 @@ func (s *httpdServer) handleWebUpdateUserGet(w http.ResponseWriter, r *http.Requ
 
 func (s *httpdServer) handleWebAddUserPost(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestSize)
-	claims, err := getTokenClaims(r)
+	claims, err := jwt.FromContext(r.Context())
 	if err != nil || claims.Username == "" {
 		s.renderForbiddenPage(w, r, util.NewI18nError(errInvalidTokenClaims, util.I18nErrorInvalidToken))
 		return
@@ -3486,7 +3506,7 @@ func (s *httpdServer) handleWebAddUserPost(w http.ResponseWriter, r *http.Reques
 
 func (s *httpdServer) handleWebUpdateUserPost(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestSize)
-	claims, err := getTokenClaims(r)
+	claims, err := jwt.FromContext(r.Context())
 	if err != nil || claims.Username == "" {
 		s.renderForbiddenPage(w, r, util.NewI18nError(errInvalidTokenClaims, util.I18nErrorInvalidToken))
 		return
@@ -3553,7 +3573,7 @@ func (s *httpdServer) handleWebGetStatus(w http.ResponseWriter, r *http.Request)
 
 func (s *httpdServer) handleWebGetConnections(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestSize)
-	claims, err := getTokenClaims(r)
+	claims, err := jwt.FromContext(r.Context())
 	if err != nil || claims.Username == "" {
 		s.renderForbiddenPage(w, r, util.NewI18nError(errInvalidTokenClaims, util.I18nErrorInvalidToken))
 		return
@@ -3570,7 +3590,7 @@ func (s *httpdServer) handleWebAddFolderGet(w http.ResponseWriter, r *http.Reque
 
 func (s *httpdServer) handleWebAddFolderPost(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestSize)
-	claims, err := getTokenClaims(r)
+	claims, err := jwt.FromContext(r.Context())
 	if err != nil || claims.Username == "" {
 		s.renderForbiddenPage(w, r, util.NewI18nError(errInvalidTokenClaims, util.I18nErrorInvalidToken))
 		return
@@ -3581,7 +3601,7 @@ func (s *httpdServer) handleWebAddFolderPost(w http.ResponseWriter, r *http.Requ
 		s.renderFolderPage(w, r, folder, folderPageModeAdd, util.NewI18nError(err, util.I18nErrorInvalidForm))
 		return
 	}
-	defer r.MultipartForm.RemoveAll() //nolint:errcheck
+	defer r.MultipartForm.RemoveAll()
 
 	ipAddr := util.GetIPFromRemoteAddress(r.RemoteAddr)
 	if err := verifyCSRFToken(r, s.csrfTokenAuth); err != nil {
@@ -3622,7 +3642,7 @@ func (s *httpdServer) handleWebUpdateFolderGet(w http.ResponseWriter, r *http.Re
 
 func (s *httpdServer) handleWebUpdateFolderPost(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestSize)
-	claims, err := getTokenClaims(r)
+	claims, err := jwt.FromContext(r.Context())
 	if err != nil || claims.Username == "" {
 		s.renderForbiddenPage(w, r, util.NewI18nError(errInvalidTokenClaims, util.I18nErrorInvalidToken))
 		return
@@ -3642,7 +3662,7 @@ func (s *httpdServer) handleWebUpdateFolderPost(w http.ResponseWriter, r *http.R
 		s.renderFolderPage(w, r, folder, folderPageModeUpdate, util.NewI18nError(err, util.I18nErrorInvalidForm))
 		return
 	}
-	defer r.MultipartForm.RemoveAll() //nolint:errcheck
+	defer r.MultipartForm.RemoveAll()
 
 	ipAddr := util.GetIPFromRemoteAddress(r.RemoteAddr)
 	if err := verifyCSRFToken(r, s.csrfTokenAuth); err != nil {
@@ -3757,7 +3777,7 @@ func (s *httpdServer) handleWebAddGroupGet(w http.ResponseWriter, r *http.Reques
 
 func (s *httpdServer) handleWebAddGroupPost(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestSize)
-	claims, err := getTokenClaims(r)
+	claims, err := jwt.FromContext(r.Context())
 	if err != nil || claims.Username == "" {
 		s.renderForbiddenPage(w, r, util.NewI18nError(errInvalidTokenClaims, util.I18nErrorInvalidToken))
 		return
@@ -3795,7 +3815,7 @@ func (s *httpdServer) handleWebUpdateGroupGet(w http.ResponseWriter, r *http.Req
 
 func (s *httpdServer) handleWebUpdateGroupPost(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestSize)
-	claims, err := getTokenClaims(r)
+	claims, err := jwt.FromContext(r.Context())
 	if err != nil || claims.Username == "" {
 		s.renderForbiddenPage(w, r, util.NewI18nError(errInvalidTokenClaims, util.I18nErrorInvalidToken))
 		return
@@ -3882,7 +3902,7 @@ func (s *httpdServer) handleWebAddEventActionGet(w http.ResponseWriter, r *http.
 
 func (s *httpdServer) handleWebAddEventActionPost(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestSize)
-	claims, err := getTokenClaims(r)
+	claims, err := jwt.FromContext(r.Context())
 	if err != nil || claims.Username == "" {
 		s.renderForbiddenPage(w, r, util.NewI18nError(errInvalidTokenClaims, util.I18nErrorInvalidToken))
 		return
@@ -3919,7 +3939,7 @@ func (s *httpdServer) handleWebUpdateEventActionGet(w http.ResponseWriter, r *ht
 
 func (s *httpdServer) handleWebUpdateEventActionPost(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestSize)
-	claims, err := getTokenClaims(r)
+	claims, err := jwt.FromContext(r.Context())
 	if err != nil || claims.Username == "" {
 		s.renderForbiddenPage(w, r, util.NewI18nError(errInvalidTokenClaims, util.I18nErrorInvalidToken))
 		return
@@ -3993,7 +4013,7 @@ func (s *httpdServer) handleWebAddEventRuleGet(w http.ResponseWriter, r *http.Re
 
 func (s *httpdServer) handleWebAddEventRulePost(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestSize)
-	claims, err := getTokenClaims(r)
+	claims, err := jwt.FromContext(r.Context())
 	if err != nil || claims.Username == "" {
 		s.renderForbiddenPage(w, r, util.NewI18nError(errInvalidTokenClaims, util.I18nErrorInvalidToken))
 		return
@@ -4031,7 +4051,7 @@ func (s *httpdServer) handleWebUpdateEventRuleGet(w http.ResponseWriter, r *http
 
 func (s *httpdServer) handleWebUpdateEventRulePost(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestSize)
-	claims, err := getTokenClaims(r)
+	claims, err := jwt.FromContext(r.Context())
 	if err != nil || claims.Username == "" {
 		s.renderForbiddenPage(w, r, util.NewI18nError(errInvalidTokenClaims, util.I18nErrorInvalidToken))
 		return
@@ -4115,7 +4135,7 @@ func (s *httpdServer) handleWebAddRolePost(w http.ResponseWriter, r *http.Reques
 		s.renderRolePage(w, r, role, genericPageModeAdd, err)
 		return
 	}
-	claims, err := getTokenClaims(r)
+	claims, err := jwt.FromContext(r.Context())
 	if err != nil || claims.Username == "" {
 		s.renderForbiddenPage(w, r, util.NewI18nError(errInvalidTokenClaims, util.I18nErrorInvalidToken))
 		return
@@ -4147,7 +4167,7 @@ func (s *httpdServer) handleWebUpdateRoleGet(w http.ResponseWriter, r *http.Requ
 
 func (s *httpdServer) handleWebUpdateRolePost(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestSize)
-	claims, err := getTokenClaims(r)
+	claims, err := jwt.FromContext(r.Context())
 	if err != nil || claims.Username == "" {
 		s.renderForbiddenPage(w, r, util.NewI18nError(errInvalidTokenClaims, util.I18nErrorInvalidToken))
 		return
@@ -4229,7 +4249,7 @@ func (s *httpdServer) handleWebAddIPListEntryPost(w http.ResponseWriter, r *http
 		return
 	}
 	entry.Type = listType
-	claims, err := getTokenClaims(r)
+	claims, err := jwt.FromContext(r.Context())
 	if err != nil || claims.Username == "" {
 		s.renderForbiddenPage(w, r, util.NewI18nError(errInvalidTokenClaims, util.I18nErrorInvalidToken))
 		return
@@ -4266,7 +4286,7 @@ func (s *httpdServer) handleWebUpdateIPListEntryGet(w http.ResponseWriter, r *ht
 
 func (s *httpdServer) handleWebUpdateIPListEntryPost(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestSize)
-	claims, err := getTokenClaims(r)
+	claims, err := jwt.FromContext(r.Context())
 	if err != nil || claims.Username == "" {
 		s.renderForbiddenPage(w, r, util.NewI18nError(errInvalidTokenClaims, util.I18nErrorInvalidToken))
 		return
@@ -4316,7 +4336,7 @@ func (s *httpdServer) handleWebConfigs(w http.ResponseWriter, r *http.Request) {
 
 func (s *httpdServer) handleWebConfigsPost(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestSize)
-	claims, err := getTokenClaims(r)
+	claims, err := jwt.FromContext(r.Context())
 	if err != nil || claims.Username == "" {
 		s.renderForbiddenPage(w, r, util.NewI18nError(errInvalidTokenClaims, util.I18nErrorInvalidToken))
 		return
@@ -4331,7 +4351,7 @@ func (s *httpdServer) handleWebConfigsPost(w http.ResponseWriter, r *http.Reques
 		s.renderBadRequestPage(w, r, util.NewI18nError(err, util.I18nErrorInvalidForm))
 		return
 	}
-	defer r.MultipartForm.RemoveAll() //nolint:errcheck
+	defer r.MultipartForm.RemoveAll()
 
 	ipAddr := util.GetIPFromRemoteAddress(r.RemoteAddr)
 	if err := verifyCSRFToken(r, s.csrfTokenAuth); err != nil {
@@ -4413,6 +4433,12 @@ func (s *httpdServer) handleOAuth2TokenRedirect(w http.ResponseWriter, r *http.R
 			util.NewI18nError(err, util.I18nOAuth2ErrorValidateState), "")
 		return
 	}
+	if !checkAuthBrowserID(r, oauth2BrowserCookieKey, pendingAuth.Browser) {
+		s.renderMessagePage(w, r, util.I18nOAuth2ErrorTitle, http.StatusBadRequest,
+			util.NewI18nError(errors.New("the authorization request was started by a different browser"),
+				util.I18nOAuth2InvalidState), "")
+		return
+	}
 	oauth2Mgr.removePendingAuth(state)
 
 	oauth2Config := smtp.OAuth2Config{
@@ -4425,7 +4451,7 @@ func (s *httpdServer) handleOAuth2TokenRedirect(w http.ResponseWriter, r *http.R
 
 	cfg := oauth2Config.GetOAuth2()
 	cfg.RedirectURL = pendingAuth.RedirectURL
-	token, err := cfg.Exchange(ctx, r.URL.Query().Get("code"))
+	token, err := cfg.Exchange(ctx, r.URL.Query().Get("code"), oauth2.VerifierOption(pendingAuth.Verifier))
 	if err != nil {
 		s.renderMessagePage(w, r, util.I18nOAuth2ErrorTitle, http.StatusInternalServerError,
 			util.NewI18nError(err, util.I18nOAuth2ErrTokenExchange), "")
